@@ -10,6 +10,8 @@ export interface VizState {
     loading: boolean
     pill: boolean
     dictationText: string
+    /** true while the user is editing the pill pills / pylons / transcript by hand */
+    pillDirty: boolean
     updatedAt: number
 }
 
@@ -36,6 +38,7 @@ export function updateVizState(partial: Partial<VizState>): void {
         loading: false,
         pill: false,
         dictationText: "",
+        pillDirty: false,
         updatedAt: 0,
     }
     writeVizState({ ...current, ...partial, updatedAt: Date.now() })

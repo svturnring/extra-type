@@ -72,7 +72,7 @@ export default class Daemon {
             this.speechPipeline = new SpeechPipeline(this.transcriptTransformer, this.typingController)
         }
         this.typingController.setPillListener((text) => {
-            updateVizState({ pill: true, dictationText: text })
+            updateVizState({ pill: true, dictationText: text, pillDirty: false })
         })
         this.punctuationEnabled = config.punctuation
         this.currentLang = config.insert_method === "dotool" ? "en-US" : config.lang
@@ -260,7 +260,18 @@ if (!body || typeof body !== "object") {
 
         this.app.post("/pill/clear", async (req, res) => {
             this.typingController.clearPill()
-            updateVizState({ pill: this.config.insert_method === "pill", dictationText: "" })
+            updateVizState({ pill: this.config.insert_method === "pill", dictationText: "", pillDirty: false })
+            res.json({ ok: true })
+        })
+
+        this.app.post("/pill/update", async (req, res) => {
+            const text = (req.body as Record<string, unknown> | undefined)?.text
+            if (typeof text !== "string") {
+                res.status(400).json({ error: "text required" })
+                return
+            }
+            this.typingController.setPillText(text)
+            updateVizState({ pill: true, dictationText: text, pillDirty: true })
             res.json({ ok: true })
         })
 
@@ -397,7 +408,7 @@ if (!body || typeof body !== "object") {
                     log("DAEMON", `failed to copy pill text to clipboard: ${e}`)
                 }
             }
-            updateVizState({ dictationText: "" })
+            updateVizState({ dictationText: "", pillDirty: false })
         }
         this.typingController.reset()
         updateVizState({ listening: false, error: null, loading: false })

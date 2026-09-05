@@ -67,6 +67,14 @@ export default class TypingController {
         if (this.onPillText) this.onPillText("")
     }
 
+    /** Replace the pill transcript from the overlay (user edits in the viz). */
+    public setPillText(text: string) {
+        if (this.insertMethod !== "pill") return
+        this.accFinal = text
+        this.prevText = ""
+        if (this.onPillText) this.onPillText(text)
+    }
+
     private rebuildSink() {
         const old = this.dotool
         this.dotool = spawnDotoolSink({ pasteCombo: this.pasteCombo, method: sinkMethod(this.insertMethod) })

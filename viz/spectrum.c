@@ -31,6 +31,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /* ------------------------------------------------------------------ */
 /* Config                                                              */
@@ -136,12 +139,14 @@ static gboolean g_was_listening = -1; /* -1 = unknown until first poll */
 
 /* pill/transcript overlay */
 static int g_port = DEFAULT_PORT;
-static char g_dict_buf[65536] = "";
 static int g_had_pill = -1;             /* -1 = unknown until first poll */
 static GtkWidget *g_pill_box = NULL;
 static GtkWidget *g_pill_scroll = NULL;
 static GtkTextView *g_textview = NULL;
 static GtkTextBuffer *g_textbuf = NULL;
+static gboolean g_pill_sync = FALSE;      /* TRUE while applying daemon text */
+static guint g_pill_update_id = 0;        /* debounce source for /pill/update */
+static char g_pill_last_sent[65536] = "";
 
 /* read chain: pipewire writes into ring; UI timer FFTs the oldest window */
 static void ui_tick(GtkWidget *w, gpointer data);
@@ -408,6 +413,111 @@ static void extract_json_string(const char *buf, const char *key, char *out, siz
     out[o] = '\0';
 }
 
+/* minimal HTTP/1.1 JSON POST to the daemon (blocking; used for debounced
+ * /pill/update from the user-edited transcript overlay) */
+static void http_post_json(const char *path, const char *json_body) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)g_port);
+    if (inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+        close(fd);
+        return;
+    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return;
+    }
+    size_t body_len = strlen(json_body);
+    size_t head_len = (size_t)snprintf(NULL, 0,
+        "POST %s HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        path, body_len);
+    size_t req_len = head_len + body_len;
+    char *req = malloc(req_len + 1);
+    if (!req) {
+        close(fd);
+        return;
+    }
+    (void)snprintf(req, head_len + 1,
+        "POST %s HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        path, body_len);
+    memcpy(req + head_len, json_body, body_len);
+    req[req_len] = '\0';
+    ssize_t w = send(fd, req, req_len, MSG_NOSIGNAL);
+    (void)w;
+    free(req);
+    close(fd);
+}
+
+/* JSON-string-escape into a buffer big enough for the transcript */
+static size_t json_escape(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (; *in && o + 6 < outsz; in++) {
+        unsigned char c = (unsigned char)*in;
+        switch (c) {
+        case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+        case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+        case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+        case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+        case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+        default:
+            if (c < 0x20) {
+                out[o] = '\0';
+                return o; /* abort rather than emit a broken body */
+            }
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/* debounced /pill/update: called shortly after the user edits the transcript */
+static gboolean pill_update_flush(gpointer data) {
+    (void)data;
+    g_pill_update_id = 0;
+    if (!g_textbuf) return G_SOURCE_REMOVE;
+
+    GtkTextIter start, end;
+    gtk_text_buffer_get_start_iter(g_textbuf, &start);
+    gtk_text_buffer_get_end_iter(g_textbuf, &end);
+    char *cur = gtk_text_buffer_get_text(g_textbuf, &start, &end, FALSE);
+
+    if (strcmp(cur, g_pill_last_sent) != 0) {
+        char body[70000];
+        size_t body_sz = sizeof(body);
+        snprintf(body, body_sz, "{\"text\":\"");
+        char esc[sizeof(body) - 16];
+        json_escape(cur, esc, sizeof(esc));
+        strncat(body, esc, sizeof(body) - strlen(body) - 3);
+        strncat(body, "\"}", 3);
+        http_post_json("/pill/update", body);
+        snprintf(g_pill_last_sent, sizeof(g_pill_last_sent), "%s", cur);
+    }
+    g_free(cur);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_pill_changed(GtkTextBuffer *buf, gpointer data) {
+    (void)buf; (void)data;
+    if (g_pill_sync) return; /* our own set_text, not a user edit */
+    if (!g_textbuf) return;
+    if (g_pill_update_id) g_source_remove(g_pill_update_id);
+    g_pill_update_id = g_timeout_add(250, pill_update_flush, NULL);
+}
+
 /* poll the daemon's viz-state.json; lighter-weight strstr scanning */
 static void poll_viz_state(void) {
     const char *home = getenv("HOME");
@@ -431,10 +541,10 @@ static void poll_viz_state(void) {
     fclose(f);
     buf[n] = '\0';
 
-    g_viz.listening = strstr(buf, "\"listening\":true") ? 1 : 0;
-    g_viz.loading   = strstr(buf, "\"loading\":true") ? 1 : 0;
-    g_viz.error     = (strstr(buf, "\"error\":null") == NULL && strstr(buf, "\"error\":\"") != NULL) ? 1 : 0;
-    g_viz.pill      = strstr(buf, "\"pill\":true") ? 1 : 0;
+    g_viz.listening      = strstr(buf, "\"listening\":true") ? 1 : 0;
+    g_viz.loading        = strstr(buf, "\"loading\":true") ? 1 : 0;
+    g_viz.error          = (strstr(buf, "\"error\":null") == NULL && strstr(buf, "\"error\":\"") != NULL) ? 1 : 0;
+    g_viz.pill           = strstr(buf, "\"pill\":true") ? 1 : 0;
 
     /* extract lang like "ru-RU" */
     g_viz.lang[0] = '\0';
@@ -450,15 +560,32 @@ static void poll_viz_state(void) {
     }
 
     /* extract dictation text */
-    char tmp[sizeof(g_dict_buf)];
+    char tmp[65536];
     extract_json_string(buf, "dictationText", tmp, sizeof(tmp));
-    if (strcmp(tmp, g_dict_buf) != 0) {
-        snprintf(g_dict_buf, sizeof(g_dict_buf), "%s", tmp);
-        if (g_textbuf) {
-            gtk_text_buffer_set_text(g_textbuf, g_dict_buf, -1);
-            GtkTextMark *end = gtk_text_buffer_get_insert(g_textbuf);
-            if (g_textview) gtk_text_view_scroll_mark_onscreen(g_textview, end);
+
+    /* Apply the daemon text ONLY when the state file actually changed since
+     * the last poll. Comparing against the buffer would also fire on user
+     * edits (typing/deleting) and clobber them back to the state text on the
+     * next tick, making the overlay uneditable. g_pill_last_sent tracks the
+     * newest text observed in the state (daemon→viz or our own pushed edit),
+     * so untouched dictation keeps flowing while a hand edit survives a poll
+     * where the state did not move. */
+    if (g_textbuf) {
+        GtkTextIter start, end;
+        gtk_text_buffer_get_start_iter(g_textbuf, &start);
+        gtk_text_buffer_get_end_iter(g_textbuf, &end);
+        char *cur = gtk_text_buffer_get_text(g_textbuf, &start, &end, FALSE);
+        int changed = strcmp(tmp, g_pill_last_sent) != 0;
+        int differs = strcmp(tmp, cur) != 0;
+        if (changed && differs) {
+            g_pill_sync = TRUE;
+            gtk_text_buffer_set_text(g_textbuf, tmp, -1);
+            g_pill_sync = FALSE;
+            snprintf(g_pill_last_sent, sizeof(g_pill_last_sent), "%s", tmp);
+            GtkTextMark *mark = gtk_text_buffer_get_insert(g_textbuf);
+            if (g_textview) gtk_text_view_scroll_mark_onscreen(g_textview, mark);
         }
+        g_free(cur);
     }
 }
 
@@ -677,6 +804,8 @@ static void viz_activate(GtkApplication *app) {
         "#pillbox scrolledwindow { background-color: transparent; }\n"
         "#pillbox textview { background-color: transparent; }\n"
         "#pillbox text { color: #e6e6e6; }\n"
+        "#pillbox textview text selection { background-color: alpha(@theme_selected_bg_color, 0.4); color: #ffffff; }\n"
+        "#pillbox textview caret { color: #ffffff; }\n"
         ".pill-caption { color: alpha(@theme_fg_color, 0.6); font-size: 11pt; }\n");
     gtk_style_context_add_provider_for_display(disp,
         GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -686,7 +815,8 @@ static void viz_activate(GtkApplication *app) {
     gtk_layer_set_layer(GTK_WINDOW(g_window), GTK_LAYER_SHELL_LAYER_OVERLAY);
     gtk_layer_set_anchor(GTK_WINDOW(g_window), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
     gtk_layer_set_margin(GTK_WINDOW(g_window), GTK_LAYER_SHELL_EDGE_BOTTOM, LAYER_MARGIN_BOTTOM);
-    gtk_layer_set_keyboard_mode(GTK_WINDOW(g_window), GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+    /* focused keyboard so the user can edit the transcript textview */
+    gtk_layer_set_keyboard_mode(GTK_WINDOW(g_window), GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
     gtk_layer_set_exclusive_zone(GTK_WINDOW(g_window), 0);
 
     gtk_widget_set_size_request(g_window, VIZ_W, VIZ_H);
@@ -710,8 +840,9 @@ static void viz_activate(GtkApplication *app) {
 
     g_textview = GTK_TEXT_VIEW(gtk_text_view_new());
     g_textbuf = gtk_text_view_get_buffer(g_textview);
-    gtk_text_view_set_editable(g_textview, FALSE);
-    gtk_text_view_set_cursor_visible(g_textview, FALSE);
+    g_signal_connect(g_textbuf, "changed", G_CALLBACK(on_pill_changed), NULL);
+    gtk_text_view_set_editable(g_textview, TRUE);
+    gtk_text_view_set_cursor_visible(g_textview, TRUE);
     gtk_text_view_set_wrap_mode(g_textview, GTK_WRAP_WORD_CHAR);
     gtk_text_view_set_monospace(g_textview, TRUE);
     gtk_text_view_set_left_margin(g_textview, 14);
