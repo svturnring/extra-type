@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Extra Type
+GenericName=Speech-to-Text Dictation
+Comment=System-wide continuous dictation for Linux/Wayland
+Exec=@BINDIR@/extra-type settings
+Icon=extra-type
+Terminal=false
+Categories=Utility;TextTools;AudioVideo;Accessibility;
+Keywords=dictation;voice;speech-to-text;transcription;mic;
+StartupNotify=true

@@ -1,0 +1,60 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  ts-c:
+    name: TypeScript + C
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install deps
+        run: bun install
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Test
+        run: bun test tests
+
+      - name: Check viz compiles
+        env:
+          PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc pkg-config libgtk-4-dev libgtk4-layer-shell-dev libpipewire-0.3-dev libsoup-3.0-dev libjson-glib-dev
+          make viz
+
+  shell:
+    name: Installer syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: sh -n
+        run: |
+          for f in install.sh uninstall.sh; do
+            echo "checking $f"
+            sh -n "$f"
+          done
+
+      - name: shellcheck
+        run: shellcheck -s sh install.sh uninstall.sh

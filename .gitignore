@@ -1,0 +1,11 @@
+node_modules
+dist
+build
+bun.lock
+TODO.md
+releases
+.cursor
+.env
+.env.*
+tools
+*.log

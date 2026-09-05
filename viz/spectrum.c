@@ -1,0 +1,747 @@
+/*
+ * extra-type-viz — native Wayland voice spectrum visualizer.
+ *
+ * A small GTK4 program that shows a live frequency spectrum (equalizer bars)
+ * as a Wayland layer-shell overlay at the bottom of the screen while the
+ * extra-type daemon is dictating. It reads the microphone through native
+ * PipeWire and computes the FFT itself, so there are no heavy external
+ * dependencies (no EasyEffects, no cava) — just GTK4, gtk4-layer-shell and
+ * libpipewire, all standard on a modern Wayland desktop.
+ *
+ * Usage: extra-type-viz [--source NAME] [--bars N] [--listen] [--once]
+ *   --listen   keep running even when extra-type asks to stop (diagnostics)
+ *   --once     exit after the first audio buffer (diagnostics)
+ *
+ * The daemon starts/stops this process by forking it; it reads stdin for
+ * control, and kills it on stop. Exit codes: 0 = requested stop.
+ */
+
+#include <gtk/gtk.h>
+#include <gtk4-layer-shell.h>
+
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/param/audio/raw.h>
+#include <spa/utils/ringbuffer.h>
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+
+/* ------------------------------------------------------------------ */
+/* Config                                                              */
+/* ------------------------------------------------------------------ */
+#define NBARS        5
+#define DEFAULT_BARS NBARS
+#define DEFAULT_PORT 3232
+#define DEFAULT_FFT    512
+#define DEFAULT_NCH    1
+#define DEFAULT_RATE   48000
+
+static int g_bars = DEFAULT_BARS;
+static int g_listen = 0;
+static int g_once = 0;
+static volatile sig_atomic_t g_quit = 0;
+
+/* ------------------------------------------------------------------ */
+/* Naive radix-2 iterative FFT (real input, magnitude output)          */
+/* ------------------------------------------------------------------ */
+static void fft_real_mag(const float *in, int n, float *mag) {
+    double *re = calloc(n, sizeof(double));
+    double *im = calloc(n, sizeof(double));
+    if (!re || !im) { free(re); free(im); memset(mag, 0, n * sizeof(float)); return; }
+
+    memcpy(re, in, n * sizeof(float));
+
+    int m = 1;
+    while (m < n) m <<= 1;
+    if (m != n) { /* force power of two */ free(re); free(im); memset(mag,0,n*sizeof(float)); return; }
+
+    /* bit reversal */
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            double tr = re[i]; re[i] = re[j]; re[j] = tr;
+            double ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+
+    for (int len = 2; len <= n; len <<= 1) {
+        double ang = -2.0 * M_PI / len;
+        double wr = cos(ang), wi = sin(ang);
+        for (int i = 0; i < n; i += len) {
+            double cur_r = 1.0, cur_i = 0.0;
+            for (int k = 0; k < len / 2; k++) {
+                int a = i + k;
+                int b = i + k + len / 2;
+                double ar = re[a], ai = im[a];
+                double br = re[b]*cur_r - im[b]*cur_i;
+                double bi = re[b]*cur_i + im[b]*cur_r;
+                re[a] = ar + br; im[a] = ai + bi;
+                re[b] = ar - br; im[b] = ai - bi;
+                double nr = cur_r*wr - cur_i*wi;
+                double ni = cur_r*wi + cur_i*wr;
+                cur_r = nr; cur_i = ni;
+            }
+        }
+    }
+
+    /* magnitude from first half */
+    for (int i = 0; i < n / 2; i++) {
+        mag[i] = (float)sqrt(re[i]*re[i] + im[i]*im[i]);
+    }
+    free(re); free(im);
+}
+
+/* ------------------------------------------------------------------ */
+/* Global audio/UI state                                               */
+/* ------------------------------------------------------------------ */
+static struct {
+    float *ring;        /* latest FFT window, float mono */
+    int    ring_len;
+    int    filled;      /* samples accumulated but not yet FFT'ed */
+    float *mag;         /* magnitude spectrum (n/2) */
+    float *bars;        /* smoothed bar levels (0..1) */
+    int    nbins;
+    int    smoothing;   /* exponential smoothing coeff in % */
+    double  rms;        /* last RMS energy */
+    float   rms_floor;  /* noise floor for activity gate */
+    float   run_peak;   /* running peak of FFT magnitude for auto-gain */
+    int    active;      /* currently "speaking" flag for idle dim */
+    float  speak;       /* smoothed 0..1 energy for smooth idle->wave fade */
+    int    idle_ticks;  /* frames since last active */
+} g_audio;
+
+/* state mirrored from the daemon's viz-state.json */
+static struct {
+    int    listening;
+    int    loading;
+    int    error;
+    int    pill;
+    char   lang[16];
+    int    tick;
+} g_viz;
+
+static GtkWidget *g_window = NULL;
+static GtkApplication *g_app = NULL;
+static GtkWidget *g_draw = NULL;
+static gboolean g_paused = FALSE;
+static gboolean g_was_listening = -1; /* -1 = unknown until first poll */
+
+/* pill/transcript overlay */
+static int g_port = DEFAULT_PORT;
+static char g_dict_buf[65536] = "";
+static int g_had_pill = -1;             /* -1 = unknown until first poll */
+static GtkWidget *g_pill_box = NULL;
+static GtkWidget *g_pill_scroll = NULL;
+static GtkTextView *g_textview = NULL;
+static GtkTextBuffer *g_textbuf = NULL;
+
+/* read chain: pipewire writes into ring; UI timer FFTs the oldest window */
+static void ui_tick(GtkWidget *w, gpointer data);
+static void viz_activate(GtkApplication *app);
+
+/* ------------------------------------------------------------------ */
+/* Pill overlay                                                        */
+/* ------------------------------------------------------------------ */
+#define PILL_MAX 65500
+
+/* ------------------------------------------------------------------ */
+/* PipeWire                                                             */
+/* ------------------------------------------------------------------ */
+static struct pw_main_loop *g_loop = NULL;
+static struct pw_stream *g_stream = NULL;
+static struct spa_hook g_stream_listener;
+static struct pw_thread_loop *g_thr_loop = NULL;
+static char g_source[129] = "";
+static int g_rate = DEFAULT_RATE;
+static int g_nch = DEFAULT_NCH;
+
+static void on_process(void *data) {
+    struct pw_buffer *b = pw_stream_dequeue_buffer(g_stream);
+    if (!b) return;
+    struct spa_buffer *buf = b->buffer;
+    if (!buf->datas || !buf->datas[0].data) {
+        pw_stream_queue_buffer(g_stream, b);
+        return;
+    }
+    float *samples = buf->datas[0].data;
+    uint32_t nbytes = buf->datas[0].chunk->size;
+    uint32_t nframes = nbytes / (g_nch * sizeof(float));
+
+    /* mix channels -> mono into ring buffer, ring holds one FFT window */
+    int k = 0;
+    for (uint32_t i = 0; i < nframes && g_audio.filled < g_audio.ring_len; i++) {
+        float acc = 0;
+        for (int c = 0; c < g_nch; c++) acc += samples[i*g_nch + c];
+        g_audio.ring[g_audio.filled++] = acc / g_nch;
+        (void)k;
+    }
+    pw_stream_queue_buffer(g_stream, b);
+}
+
+static const struct pw_stream_events stream_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_process,
+};
+
+static gboolean build_pipewire(void) {
+    if (!getenv("SPA_PLUGIN_DIR"))
+        setenv("SPA_PLUGIN_DIR", "/usr/lib/spa-0.2", 0);
+    if (!getenv("PIPEWIRE_MODULE_DIR"))
+        setenv("PIPEWIRE_MODULE_DIR", "/usr/lib/pipewire-0.3", 0);
+    pw_init(NULL, NULL);
+    g_thr_loop = pw_thread_loop_new("extra-type-viz", NULL);
+    if (!g_thr_loop) return FALSE;
+
+    struct pw_properties *cprops = pw_properties_new(
+        "context.spa-libs",
+        "support.*=support/libspa-support\n"
+        "audio.convert.*=audioconvert/libspa-audioconvert\n"
+        "api.alsa.*=alsa/libspa-alsa",
+        NULL);
+    struct pw_context *ctx = pw_context_new(pw_thread_loop_get_loop(g_thr_loop), cprops, 0);
+    if (!ctx) return FALSE;
+    struct pw_core *core = pw_context_connect(ctx, NULL, 0);
+    if (!core) return FALSE;
+
+    struct pw_properties *props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE, "Communication",
+        PW_KEY_NODE_NAME, "extra-type-viz",
+        PW_KEY_NODE_DESCRIPTION, "extra-type voice spectrum",
+        NULL);
+    if (g_source[0]) {
+        pw_properties_set(props, PW_KEY_TARGET_OBJECT, g_source);
+    }
+    g_stream = pw_stream_new(core, "extra-type-viz", props);
+
+    uint8_t buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    const struct spa_pod *params[1];
+    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
+        &SPA_AUDIO_INFO_RAW_INIT(
+            .format = SPA_AUDIO_FORMAT_F32_LE,
+            .channels = g_nch,
+            .rate = g_rate));
+    pw_stream_add_listener(g_stream, &g_stream_listener, &stream_events, NULL);
+    pw_stream_connect(g_stream, PW_DIRECTION_INPUT,
+        PW_ID_ANY, PW_STREAM_FLAG_AUTOCONNECT |
+        PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
+        params, 1);
+
+    int r = pw_thread_loop_start(g_thr_loop);
+    return r == 0;
+}
+
+static void teardown_pipewire(void) {
+    if (g_thr_loop) {
+        pw_thread_loop_stop(g_thr_loop);
+        pw_thread_loop_destroy(g_thr_loop);
+    }
+    if (g_stream) pw_stream_destroy(g_stream);
+    pw_deinit();
+}
+
+/* ------------------------------------------------------------------ */
+/* GTK / layer-shell                                                    */
+/* ------------------------------------------------------------------ */
+#define BAR_W_DEFAULT 22
+#define BAR_GAP 6
+#define VIZ_W 127
+#define VIZ_H 48
+#define LAYER_MARGIN_BOTTOM 6
+
+/* rounded rect (capsule) path helper; (x,y) top-left, w,h box, r corner radius */
+static void rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r) {
+    double rc = r < h / 2.0 ? r : h / 2.0;
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - rc, y + rc, rc, -G_PI / 2, 0);
+    cairo_arc(cr, x + w - rc, y + h - rc, rc, 0, G_PI / 2);
+    cairo_arc(cr, x + rc, y + h - rc, rc, G_PI / 2, G_PI);
+    cairo_arc(cr, x + rc, y + rc, rc, G_PI, 3 * G_PI / 2);
+    cairo_close_path(cr);
+}
+
+static void on_draw(GtkDrawingArea *area, cairo_t *cr, int wt, int h, gpointer data) {
+    (void)area; (void)data;
+    int W = wt, H = h;
+
+    /* clear (transparent) */
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.0);
+    cairo_paint(cr);
+
+    /* compact rounded-full dark pill */
+    double pr = H / 2.0;
+    rounded_rect(cr, 0.5, 0.5, W - 1, H - 1, pr);
+    cairo_set_source_rgba(cr, 0.09, 0.10, 0.12, 1.0);
+    cairo_fill_preserve(cr);
+    cairo_set_line_width(cr, 1.0);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.10);
+    cairo_stroke(cr);
+
+    int tick = g_viz.tick;
+    double pulse = 0.5 + 0.5 * sin((double)tick * 0.35);
+
+    /* accent colour by state */
+    double r, g, b;
+    if (g_viz.error) {
+        r = 0.96; g = 0.36; b = 0.34;           /* red = error */
+    } else if (g_viz.loading) {
+        r = 0.98; g = 0.78; b = 0.30;           /* amber = loading */
+    } else {
+        r = 0.45; g = 0.90; b = 0.72;           /* teal = normal */
+    }
+
+    /* local language label */
+    char label[8] = "";
+    if (g_viz.lang[0]) {
+        if (strncmp(g_viz.lang, "ru", 2) == 0) snprintf(label, sizeof(label), "RU");
+        else if (strncmp(g_viz.lang, "en", 2) == 0) snprintf(label, sizeof(label), "EN");
+        else snprintf(label, sizeof(label), "%.2s", g_viz.lang);
+    }
+
+    /* metrics */
+    double bw = 8.0;
+    double gap = 6.0;
+    double barsW = NBARS * bw + (NBARS - 1) * gap;
+
+    /* measure the label so the whole cluster can be centred */
+    double lw = 0.0;
+    if (label[0]) {
+        cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, 12);
+        cairo_text_extents_t te;
+        cairo_text_extents(cr, label, &te);
+        lw = te.x_advance;
+    }
+    double label_bars_gap = label[0] ? 10.0 : 0.0;
+    double side = 19.0;                     /* real padding on each side */
+    double startX = side;
+
+    double cy = H / 2.0;
+    double maxHalf = 12.0;                   /* max bar half-height (shorter) */
+    double dim = g_audio.active ? 1.0 : 0.5;
+
+    /* label */
+    if (label[0]) {
+        cairo_set_source_rgba(cr, r, g, b, g_viz.loading ? 0.55 + 0.45 * pulse : 0.8);
+        cairo_move_to(cr, startX, cy + 4.0);
+        cairo_show_text(cr, label);
+    }
+
+    /* bars */
+    double barsX = startX + lw + label_bars_gap;
+    for (int i = 0; i < NBARS; i++) {
+        float lv = g_audio.bars[i];
+        if (lv < 0) lv = 0;
+        if (lv > 1) lv = 1;
+        double boost;
+        if (g_viz.loading) {
+            double phase = tick * 0.06;
+            boost = 0.6 + 0.4 * (0.5 + 0.5 * sin(phase - i * 1.1));
+            dim = 1.0;
+        } else if (g_viz.error) {
+            boost = 0.55 + 0.3 * (1.0 - pulse);
+        } else if (g_viz.listening) {
+            /* smooth blend between silent idle circles and speaking wave.
+             * g_audio.speak (0..1) rises/falls smoothly, so the transition is
+             * animated rather than instant. */
+            (void)lv;
+            double wave = 0.5 + 0.5 * sin(tick * 0.10 - i * 1.1);
+            double boost_wave = 0.15 + 0.85 * wave * wave;
+            double s = g_audio.speak;
+            boost = boost_wave * s;                    /* idle (s=0) keeps small circle */
+            dim = 0.35 + (1.0 - 0.35) * s;             /* brighten as you speak */
+        } else {
+            (void)lv;
+            boost = 0.0;
+            dim = 0.35;
+        }
+        double bh = 8.0 + boost * (2.0 * maxHalf - 8.0);   /* total height, centred on cy */
+        double bx = barsX + i * (bw + gap);
+        rounded_rect(cr, bx, cy - bh / 2.0, bw, bh, bw / 2.0);
+        cairo_set_source_rgba(cr, r, g, b, g_viz.loading ? 0.6 + 0.4 * pulse : 0.95 * dim);
+        cairo_fill(cr);
+    }
+}
+
+/* extract a JSON string value "key":"..." unescaping \" \\ \n \t \r */
+static void extract_json_string(const char *buf, const char *key, char *out, size_t outsz) {
+    out[0] = '\0';
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    char *p = strstr(buf, needle);
+    if (!p) return;
+    p += strlen(needle);
+    size_t o = 0;
+    while (*p && *p != '"' && o < outsz - 1) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'n': out[o++] = '\n'; break;
+            case 't': out[o++] = '\t'; break;
+            case 'r': out[o++] = '\r'; break;
+            case '"': out[o++] = '"';  break;
+            case '\\': out[o++] = '\\'; break;
+            case 'u': /* \uXXXX: leave as literal, best effort */
+                if (p[1] && p[2] && p[3] && p[4]) {
+                    out[o++] = '?';
+                    p += 4;
+                }
+                break;
+            default:  out[o++] = *p; break;
+            }
+            p++;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* poll the daemon's viz-state.json; lighter-weight strstr scanning */
+static void poll_viz_state(void) {
+    const char *home = getenv("HOME");
+    const char *state = getenv("XDG_STATE_HOME");
+    char path[512];
+    if (state && state[0])
+        snprintf(path, sizeof(path), "%s/extra-type/viz-state.json", state);
+    else
+        snprintf(path, sizeof(path), "%s/.local/state/extra-type/viz-state.json", home ? home : "/tmp");
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        g_viz.listening = 0;
+        g_viz.loading = 0;
+        g_viz.error = 0;
+        g_viz.pill = 0;
+        return;
+    }
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    g_viz.listening = strstr(buf, "\"listening\":true") ? 1 : 0;
+    g_viz.loading   = strstr(buf, "\"loading\":true") ? 1 : 0;
+    g_viz.error     = (strstr(buf, "\"error\":null") == NULL && strstr(buf, "\"error\":\"") != NULL) ? 1 : 0;
+    g_viz.pill      = strstr(buf, "\"pill\":true") ? 1 : 0;
+
+    /* extract lang like "ru-RU" */
+    g_viz.lang[0] = '\0';
+    char *p = strstr(buf, "\"lang\":\"");
+    if (p) {
+        p += 8;
+        char *q = strchr(p, '"');
+        if (q && (size_t)(q - p) < (int)sizeof(g_viz.lang) - 1) {
+            int len = (int)(q - p);
+            memcpy(g_viz.lang, p, len);
+            g_viz.lang[len] = '\0';
+        }
+    }
+
+    /* extract dictation text */
+    char tmp[sizeof(g_dict_buf)];
+    extract_json_string(buf, "dictationText", tmp, sizeof(tmp));
+    if (strcmp(tmp, g_dict_buf) != 0) {
+        snprintf(g_dict_buf, sizeof(g_dict_buf), "%s", tmp);
+        if (g_textbuf) {
+            gtk_text_buffer_set_text(g_textbuf, g_dict_buf, -1);
+            GtkTextMark *end = gtk_text_buffer_get_insert(g_textbuf);
+            if (g_textview) gtk_text_view_scroll_mark_onscreen(g_textview, end);
+        }
+    }
+}
+
+static gboolean ui_tick_cb(gpointer data) {
+    if (g_quit) {
+        if (g_app) g_application_quit(G_APPLICATION(g_app));
+        return G_SOURCE_REMOVE;
+    }
+    ui_tick(data, NULL);
+    return G_SOURCE_CONTINUE;
+}
+
+/* called on gtk main loop; pull oldest FFT window, compute bars */
+static void ui_tick(GtkWidget *w, gpointer data) {
+    (void)w; (void)data;
+
+    int n = g_audio.ring_len;
+    if (g_audio.filled >= n) {
+        /* compute FFT on last n samples */
+        float *win = malloc(n * sizeof(float));
+        memcpy(win, g_audio.ring + g_audio.filled - n, n * sizeof(float));
+
+        /* RMS */
+        double sum = 0;
+        for (int i = 0; i < n; i++) sum += win[i]*win[i];
+        double rms = sqrt(sum / n);
+        g_audio.rms = rms;
+        g_audio.active = rms > g_audio.rms_floor;
+        if (g_audio.active) g_audio.idle_ticks = 0;
+        else if (g_audio.idle_ticks < 1000000) g_audio.idle_ticks++;
+        /* smoothed activity level -> smooth idle/wave transition */
+        float speak_target = g_audio.active ? 1.0f : 0.0f;
+        g_audio.speak += (speak_target - g_audio.speak) * 0.12f;
+        if (g_audio.speak < 0.001f) g_audio.speak = 0.0f;
+
+        fft_real_mag(win, n, g_audio.mag);
+        free(win);
+
+        /* map log-frequency bins to bars */
+        int nbins = g_audio.nbins;
+        int half = n / 2;
+        double min_log = log(70.0);
+        double max_log = log(6000.0);
+        for (int b = 0; b < nbins; b++) {
+            double lo = (double)b / nbins;
+            double hi = (double)(b + 1) / nbins;
+            double fl = exp(min_log + lo * (max_log - min_log));
+            double fh = exp(min_log + hi * (max_log - min_log));
+            int il = (int)(fl * n / (double)g_rate);
+            int ih = (int)(fh * n / (double)g_rate);
+            if (il < 0) il = 0;
+            if (ih >= half) ih = half - 1;
+            if (il > ih) ih = il;
+            float peak = 0;
+            for (int j = il; j <= ih; j++) peak = peak > g_audio.mag[j] ? peak : g_audio.mag[j];
+            g_audio.bars[b] = peak;
+        }
+
+        /* auto-gain: normalise each window by its own loudest bin so the bars
+         * actually rise while dictating instead of flattening to the idle size */
+        float win_max = 0;
+        for (int b = 0; b < nbins; b++) if (g_audio.bars[b] > win_max) win_max = g_audio.bars[b];
+        if (win_max > g_audio.run_peak * 1.5f) g_audio.run_peak = win_max;      /* fast rise */
+        else g_audio.run_peak = g_audio.run_peak * 0.90f + win_max * 0.10f;     /* slow decay */
+        if (g_audio.run_peak < 512.0f) g_audio.run_peak = 512.0f;               /* min floor */
+
+        float smooth = g_audio.smoothing / 100.0f;
+        for (int b = 0; b < nbins; b++) {
+            float idi = g_audio.bars[b] / g_audio.run_peak * 0.92f;   /* 0..~1, headroom */
+            if (idi > 1.0f) idi = 1.0f;
+            if (idi < 0.0f) idi = 0.0f;
+            g_audio.bars[b] = g_audio.bars[b] * smooth + idi * (1.0f - smooth);
+        }
+
+        g_audio.filled = 0; /* start next window fresh */
+    }
+
+    if ((++g_viz.tick % 6) == 0)
+        poll_viz_state();
+
+    /* the pill exists only while the daemon is listening: show on start of
+     * dictation, hide when it sleeps (or the daemon/state file goes away).
+     * In overlay mode (pill) the transcript panel is shown instead of the
+     * spectrum and only while dictating — after stop the text goes to the
+     * clipboard and the overlay hides. */
+    int overlay_on = g_viz.pill && g_viz.listening;
+    if (g_was_listening != g_viz.listening || g_had_pill != g_viz.pill) {
+        g_was_listening = g_viz.listening;
+        g_had_pill = g_viz.pill;
+        gboolean now_show = g_viz.listening || overlay_on;
+        gtk_widget_set_visible(g_window, now_show);
+        if (g_viz.pill) {
+            gtk_widget_set_size_request(g_window, 560, 220);
+        } else {
+            gtk_widget_set_size_request(g_window, VIZ_W, VIZ_H);
+        }
+    }
+
+    /* spectrum above the transcript is hidden in overlay mode */
+    if (g_pill_box) {
+        gboolean want_pill_visible = overlay_on;
+        gboolean pill_visible = gtk_widget_get_visible(g_pill_box);
+        if (pill_visible != want_pill_visible)
+            gtk_widget_set_visible(g_pill_box, want_pill_visible);
+        gtk_widget_set_visible(g_draw, !want_pill_visible);
+    }
+
+    gtk_widget_queue_draw(GTK_WIDGET(g_draw));
+    if (g_once) exit(0);
+}
+
+/* ------------------------------------------------------------------ */
+/* CLI + signal                                                        */
+/* ------------------------------------------------------------------ */
+static void on_sigint(int sig) {
+    (void)sig;
+    g_quit = 1;
+    if (g_thr_loop) pw_thread_loop_signal(g_thr_loop, FALSE);
+    if (g_loop) pw_main_loop_quit(g_loop);
+}
+
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "  --source NAME   PipeWire source node name to capture (default: default input)\n"
+        "  --bars N        number of spectrum bars (default %d)\n"
+        "  --port N        daemon HTTP port for the transcript overlay (default %d)\n"
+        "  --listen        keep running until stdin EOF (daemon mode)\n"
+        "  --once          exit after one FFT window (diagnostics)\n"
+        "  --help          show this help\n",
+        prog, DEFAULT_BARS, DEFAULT_PORT);
+}
+
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
+            snprintf(g_source, sizeof(g_source), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--bars") == 0 && i + 1 < argc) {
+            g_bars = atoi(argv[++i]);
+            if (g_bars < 1) g_bars = 1;
+            if (g_bars > 64) g_bars = 64;
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            g_port = atoi(argv[++i]);
+            if (g_port < 1 || g_port > 65536) g_port = DEFAULT_PORT;
+        } else if (strcmp(argv[i], "--listen") == 0) {
+            g_listen = 1;
+        } else if (strcmp(argv[i], "--once") == 0) {
+            g_once = 1;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
+
+    signal(SIGTERM, on_sigint);
+    signal(SIGINT, on_sigint);
+
+    g_audio.nbins = g_bars;
+    g_audio.active = 1; /* assume listening until first real rms */
+    g_audio.smoothing = 55;
+    g_audio.rms_floor = 0.0008f;
+    g_audio.run_peak = 512.0f;
+    g_audio.speak = 0.0f;
+
+    g_audio.ring_len = DEFAULT_FFT;
+    g_audio.ring = calloc(g_audio.ring_len, sizeof(float));
+    g_audio.mag = calloc(DEFAULT_FFT / 2, sizeof(float));
+    g_audio.bars = calloc(g_bars, sizeof(float));
+    if (!g_audio.ring || !g_audio.mag || !g_audio.bars) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+
+    GtkApplication *app = gtk_application_new("org.extra.type.viz", 0);
+    g_app = app;
+    g_signal_connect(app, "activate", G_CALLBACK(viz_activate), NULL);
+    /* --listen/--once are our own options; GApplication would reject them,
+     * so hand it a clean argv of just the program name when they are set. */
+    char *clean_argv[] = { argv[0] ? argv[0] : "extra-type-viz", NULL };
+    int n_run = (g_listen || g_once) ? 1 : argc;
+    char **run_argv = (g_listen || g_once) ? clean_argv : argv;
+    int status = g_application_run(G_APPLICATION(app), n_run, run_argv);
+    g_object_unref(app);
+
+    teardown_pipewire();
+    free(g_audio.ring);
+    free(g_audio.mag);
+    free(g_audio.bars);
+    return status;
+}
+
+static void viz_activate(GtkApplication *app) {
+    if (!getenv("SPA_PLUGIN_DIR"))
+        setenv("SPA_PLUGIN_DIR", "/usr/lib/spa-0.2", 0);
+    if (!getenv("PIPEWIRE_MODULE_DIR"))
+        setenv("PIPEWIRE_MODULE_DIR", "/usr/lib/pipewire-0.3", 0);
+    pw_init(NULL, NULL);
+    g_loop = pw_main_loop_new(NULL);
+    if (!build_pipewire()) {
+        fprintf(stderr, "Failed to connect to PipeWire (is a compositor/audio running?)\n");
+        exit(1);
+    }
+
+    /* make the layer surface transparent so the pill's rounded corners show
+     * against the desktop instead of an opaque rectangular backdrop */
+    GdkDisplay *disp = gdk_display_get_default();
+    GtkCssProvider *css = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(css,
+        "window { background-color: transparent; }\n"
+        "drawingarea { background: transparent; }\n"
+        "#pillbox { background-color: rgba(22, 24, 30, 1.0); border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); }\n"
+        "#pillbox scrolledwindow { background-color: transparent; }\n"
+        "#pillbox textview { background-color: transparent; }\n"
+        "#pillbox text { color: #e6e6e6; }\n"
+        ".pill-caption { color: alpha(@theme_fg_color, 0.6); font-size: 11pt; }\n");
+    gtk_style_context_add_provider_for_display(disp,
+        GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    g_window = gtk_application_window_new(app);
+    gtk_layer_init_for_window(GTK_WINDOW(g_window));
+    gtk_layer_set_layer(GTK_WINDOW(g_window), GTK_LAYER_SHELL_LAYER_OVERLAY);
+    gtk_layer_set_anchor(GTK_WINDOW(g_window), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
+    gtk_layer_set_margin(GTK_WINDOW(g_window), GTK_LAYER_SHELL_EDGE_BOTTOM, LAYER_MARGIN_BOTTOM);
+    gtk_layer_set_keyboard_mode(GTK_WINDOW(g_window), GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(g_window), 0);
+
+    gtk_widget_set_size_request(g_window, VIZ_W, VIZ_H);
+    gtk_window_set_decorated(GTK_WINDOW(g_window), FALSE);
+
+    g_draw = gtk_drawing_area_new();
+    gtk_widget_set_size_request(g_draw, VIZ_W, VIZ_H);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(g_draw), on_draw, NULL, NULL);
+
+    /* root box: spectrum on top, transcript overlay below */
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_box_append(GTK_BOX(root), g_draw);
+    gtk_widget_set_halign(g_draw, GTK_ALIGN_START);
+
+    /* transcript overlay (only in pill mode) */
+    g_pill_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_name(g_pill_box, "pillbox");
+    gtk_widget_set_visible(g_pill_box, FALSE);
+    gtk_widget_set_hexpand(g_pill_box, TRUE);
+    gtk_widget_set_halign(g_pill_box, GTK_ALIGN_FILL);
+
+    g_textview = GTK_TEXT_VIEW(gtk_text_view_new());
+    g_textbuf = gtk_text_view_get_buffer(g_textview);
+    gtk_text_view_set_editable(g_textview, FALSE);
+    gtk_text_view_set_cursor_visible(g_textview, FALSE);
+    gtk_text_view_set_wrap_mode(g_textview, GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_monospace(g_textview, TRUE);
+    gtk_text_view_set_left_margin(g_textview, 14);
+    gtk_text_view_set_right_margin(g_textview, 14);
+    gtk_text_view_set_top_margin(g_textview, 12);
+    gtk_text_view_set_bottom_margin(g_textview, 12);
+    gtk_widget_set_size_request(GTK_WIDGET(g_textview), 540, 128);
+
+    g_pill_scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(g_pill_scroll),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(g_pill_scroll), GTK_WIDGET(g_textview));
+    gtk_widget_set_size_request(g_pill_scroll, 540, 128);
+    gtk_box_append(GTK_BOX(g_pill_box), g_pill_scroll);
+
+    /* hint the user the transcript is copied on stop */
+    GtkWidget *caption = gtk_label_new("Turn off dictation to copy the text");
+    gtk_widget_set_halign(caption, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(caption, 4);
+    gtk_widget_set_margin_bottom(caption, 4);
+    gtk_widget_set_margin_start(caption, 14);
+    gtk_widget_add_css_class(caption, "pill-caption");
+    gtk_box_append(GTK_BOX(g_pill_box), caption);
+
+    gtk_box_append(GTK_BOX(root), g_pill_box);
+
+    gtk_window_set_child(GTK_WINDOW(g_window), root);
+
+    g_timeout_add(33, ui_tick_cb, g_draw); /* ~30 fps */
+
+    /* start hidden; only shown while the daemon is listening */
+    gtk_widget_set_visible(g_window, FALSE);
+}
