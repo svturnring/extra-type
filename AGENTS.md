@@ -15,9 +15,10 @@ A system-wide speech-to-text daemon for Linux/Wayland.
 - `layoutWatcher.ts` — pluggable layout detection chain (replaces hardcoded hyprctl).
 - `layoutProviders/` — chain: hypr → sway → xkb → fallback. Each provider is optional.
 - `tray.ts` — StatusNotifierItem (SNI) via `dbus-next` + DBusMenu (toggle, settings, quit).
-- `dotoolSink.ts`, `typingController.ts` — text insertion via wtype. Default `insert_method: "type"` types each character
-  as an exact XKB keysym from a keymap wtype builds/upload itself (layout-independent for native-Wayland apps, no clipboard).
-  `"paste"` mode does wl-copy + wtype paste combo (works in XWayland apps, costs clipboard history + a paste binding).
+- `dotoolSink.ts`, `typingController.ts` — text insertion. Default `insert_method: "type"` types each character
+  as an exact XKB keysym from a keymap wtype builds/uploads itself (layout-independent for native-Wayland apps, no clipboard).
+  `"paste"` does wl-copy + wtype paste combo (works in XWayland apps, costs clipboard history + a paste binding).
+  `"dotool"` types through `/dev/uinput` via the `dotool` server (English only, works in Chrome/XWayland).
 - `speechEventGate.ts`, `speechPipeline.ts`, `transcriptTransformers/` — speech event handling.
 - `hotkey.ts` — spawns/kills `extra-type-hotkey` (evdev global hotkey helper) when config `hotkey` is set.
 - `viz/hotkey.c` — pure-libc helper: grabs keyboards at evdev layer, passes keys through via /dev/uinput, swallows the combo key and POSTs `/toggle`. No external deps (kernel headers only). Works together with keyd by grabbing keyd's virtual keyboard when the physical ones are busy.
@@ -51,10 +52,11 @@ Or single-command install: `sh install.sh`
 - `timeout` (int seconds, default 0) — silence auto-stop
 - `sound` (bool, default true) — embedded start/stop sounds + system sounds for errors
 - `punctuation` (bool) — spoken punctuation for English
-- `insert_method` ("type"|"paste"|"pill", default "type") — "type" types chars as exact keysyms via wtype (no clipboard, works in any
+- `insert_method` ("type"|"paste"|"pill"|"dotool", default "type") — "type" types chars as exact keysyms via wtype (no clipboard, works in any
   app accepting keystrokes; layout-independent for native-Wayland apps); "paste" uses wl-copy + a paste combo (XWayland-safe,
   costs clipboard history, depends on the app's paste binding); "pill" types nothing — the transcript collects into the
-  visualizer overlay (works in any app, incl. XWayland) and is copied out with the overlay buttons
+  visualizer overlay (works in any app, incl. XWayland) and is copied out with the overlay buttons; "dotool" types via
+  `/dev/uinput` through the `dotool` server (English only; forces lang to en-US, for apps that mishandle wtype)
 - `paste` (string, default "ctrl+v") — the paste combo used when `insert_method: "paste"`, e.g. `"ctrl+shift+v"` (mods+keyname)
 - `visualizer: { enabled, path }`
 
@@ -62,6 +64,7 @@ Or single-command install: `sh install.sh`
 
 - Chrome/Chromium (Web Speech API)
 - wtype (char typing via Wayland virtual keyboard); wl-copy only when `insert_method: "paste"`
+- dotool only when `insert_method: "dotool"` (needs `/dev/uinput` access, `input` group)
 - GTK4, gtk4-layer-shell, PipeWire, libsoup3, json-glib (viz + settings window)
 - dbus-next (tray icon)
 
@@ -79,13 +82,14 @@ Works only where a provider answers: Hyprland (`hyprctl`), Sway (`swaymsg`), X11
 
 ### Text insertion
 
-Two methods (`insert_method`), plus a collect mode — selectable in the settings window:
+**Three methods (`insert_method`), plus a collect mode — selectable in the settings window:**
 
 - **`type` (default)** — wtype types each character as the exact XKB keysym. wtype uploads its own keymap
   (every needed char gets its own key → keysym) through `zwp_virtual_keyboard_v1`, so native-Wayland apps receive the
   precise character regardless of the active layout — no clipboard (clipboard history untouched), no paste binding
   (works in vim, terminals, anything that accepts keystrokes). Same mechanism nerd-dictation uses.
-  Limitation: XWayland/X11 apps interpret keycodes against their own keymap and can render garbage — use `paste` or `pill` there.
+  Limitation: XWayland/X11 apps interpret keycodes against their own keymap and can render garbage — use `paste`, `pill`
+  or `dotool` there.
 - **`paste`** — wl-copy + wtype pressing a configurable paste combo (`paste`, default `ctrl+v`). Verbatim text lands
   everywhere including XWayland, at the cost of clipboard history and a working paste binding in the target app.
 - **`pill`** — nothing is typed. The transcript collects into the visualizer overlay (a dark, rounded, bordered text area shown
@@ -93,8 +97,14 @@ Two methods (`insert_method`), plus a collect mode — selectable in the setting
   the needed spaces. On stop, the full transcript is copied to the clipboard automatically (`wl-copy`) and the overlay resets,
   with a caption hinting to turn off dictation to copy. Works in every app including X11/XWayland — nothing is injected into it.
   The daemon pushes the text into viz-state (`dictationText`/`pill`).
+- **`dotool`** — types through `/dev/uinput` via the `dotool` server (spawned directly on stdin, as nerd-dictation's
+  DOTOOL backend — not via the `dotoolc` client). Apps treat it as a real physical keyboard, so it works in Chrome,
+  Electron and XWayland apps where wtype's virtual-keyboard keymap is mishandled. **English only**: keysyms are resolved
+  against the `us` layout, so the target app must be on the US layout; selecting it forces `lang` to `en-US` and disables
+  layout auto-detect. Requires `dotool` installed and `/dev/uinput` access.
 
-Backspace/Enter are always wtype keysyms (`BackSpace`, `Return`), independent of the method. The settings window
+Backspace/Enter are always wtype keysyms (`BackSpace`, `Return`) for the native-wtype backends; the dotool sink
+maps them to dotool's own key names (`key backspace`, `key enter`), independent of the method. The settings window
 captures the paste combo with the same key-grabber as the hotkey but stores named keys (`ctrl+shift+v`), not evdev codes.
 
 ### Hotkey helper
