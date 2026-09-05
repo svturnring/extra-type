@@ -75,7 +75,7 @@ export default class Daemon {
             updateVizState({ pill: true, dictationText: text })
         })
         this.punctuationEnabled = config.punctuation
-        this.currentLang = config.lang
+        this.currentLang = config.insert_method === "dotool" ? "en-US" : config.lang
         this.app = express()
         this.app.use(express.json())
         this.setupRoutes()
@@ -204,13 +204,26 @@ if (!body || typeof body !== "object") {
                     }
                 }
                 if ("insert_method" in body) {
-                    if (body.insert_method === "type" || body.insert_method === "paste" || body.insert_method === "pill") {
+                    if (body.insert_method === "type" || body.insert_method === "paste" || body.insert_method === "pill" || body.insert_method === "dotool") {
                         this.config.insert_method = body.insert_method
                         this.typingController.setInsertMethod(body.insert_method)
                         if (body.insert_method !== "pill") {
                             updateVizState({ pill: false, dictationText: "" })
                         } else {
                             updateVizState({ pill: true, dictationText: "" })
+                        }
+                        if (body.insert_method === "dotool") {
+                            /* dotool is English-only (resolved against the US
+                             * layout); force the language and stop auto-detect
+                             * so recognition runs with en-US. */
+                            if (this.config.autodetect_lang) {
+                                this.config.autodetect_lang = false
+                                this.layoutWatcher.stop()
+                            }
+                            if (this.currentLang !== "en-US") {
+                                this.config.lang = "en-US"
+                                await this.applyLanguage("en-US")
+                            }
                         }
                     } else {
                         log("DAEMON", "POST /config: invalid insert_method, ignored")

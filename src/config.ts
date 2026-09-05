@@ -215,10 +215,10 @@ export function validateConfig(raw: unknown): ExtraTypeConfig {
         warn("paste", `must be a non-empty string, using default ${DEFAULT_CONFIG.paste}`)
     }
 
-    if (obj.insert_method === "type" || obj.insert_method === "paste" || obj.insert_method === "pill") {
+    if (obj.insert_method === "type" || obj.insert_method === "paste" || obj.insert_method === "pill" || obj.insert_method === "dotool") {
         result.insert_method = obj.insert_method
     } else if ("insert_method" in obj) {
-        warn("insert_method", `must be "type", "paste" or "pill", using default ${DEFAULT_CONFIG.insert_method}`)
+        warn("insert_method", `must be "type", "paste", "pill" or "dotool", using default ${DEFAULT_CONFIG.insert_method}`)
     }
 
     if (typeof obj.visualizer === "object" && obj.visualizer !== null) {

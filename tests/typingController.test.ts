@@ -98,6 +98,7 @@ describe("TypingController", () => {
         const sink = new CapturingSink()
         const tc = new TypingController(sink)
         tc.setInsertMethod("paste")
+        tc.setInsertMethod("dotool")
         tc.setInsertMethod("type")
         tc.setInsertMethod("bogus" as never)
         tc.applyLiveText("hello")

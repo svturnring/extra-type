@@ -226,6 +226,7 @@ static void load_config(void) {
         int idx = 0;
         if (strcmp(method, "paste") == 0) idx = 1;
         else if (strcmp(method, "pill") == 0) idx = 2;
+        else if (strcmp(method, "dotool") == 0) idx = 3;
         gtk_drop_down_set_selected(g_insert_dropdown, idx);
         g_free(method);
     }
@@ -286,6 +287,7 @@ static void on_insert_changed(GtkDropDown *dd, GParamSpec *pspec, gpointer user_
     const char *method = "type";
     if (idx == 1) method = "paste";
     else if (idx == 2) method = "pill";
+    else if (idx == 3) method = "dotool";
     char *json = g_strdup_printf("{\"insert_method\":\"%s\"}", method);
     push_config(json);
     g_free(json);
@@ -691,6 +693,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_string_list_append(ins_list, "Type characters (no clipboard)");
     gtk_string_list_append(ins_list, "Paste via clipboard");
     gtk_string_list_append(ins_list, "Collect into overlay (copy anywhere)");
+    gtk_string_list_append(ins_list, "Dotool (uinput) - English layout only");
     g_insert_dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(ins_list), NULL));
     gtk_drop_down_set_selected(g_insert_dropdown, 0);
     gtk_widget_set_hexpand(GTK_WIDGET(g_insert_dropdown), TRUE);
@@ -716,7 +719,10 @@ static void activate(GtkApplication *app, gpointer user_data) {
         "Paste is a fallback for XWayland/X11 apps; set the combo to your app's\n"
         "paste binding (default Ctrl+V, reset with Clear).\n"
         "Overlay mode works everywhere: the transcript collects into the pill\n"
-        "and you copy it out (button) and paste where you like.");
+        "and you copy it out (button) and paste where you like.\n"
+        "Dotool types via uinput (needs dotool and /dev/uinput access, works in\n"
+        "XWayland apps and Chrome). English only; language is set to English and\n"
+        "the system layout must be US/English for correct output.");
     gtk_widget_set_halign(ins_note, GTK_ALIGN_START);
     gtk_widget_add_css_class(ins_note, "auto-note");
     PangoAttrList *ins_note_attrs = pango_attr_list_new();

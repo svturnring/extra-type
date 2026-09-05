@@ -51,7 +51,7 @@ export default class TypingController {
 
     /** Swap insertion method live ("type"/"paste" keysyms vs "pill" collect). */
     public setInsertMethod(method: InsertMethod) {
-        if (method !== "type" && method !== "paste" && method !== "pill") return
+        if (method !== "type" && method !== "paste" && method !== "pill" && method !== "dotool") return
         if (method === this.insertMethod) return
         this.insertMethod = method
         this.prevText = ""
@@ -176,8 +176,9 @@ export default class TypingController {
     }
 }
 
-function sinkMethod(method: InsertMethod): "type" | "paste" {
-    return method === "pill" ? "type" : method
+function sinkMethod(method: InsertMethod): "type" | "paste" | "dotool" {
+    if (method === "pill") return "type"
+    return method
 }
 
 function findCommonPrefixLen(currText: string, prevText: string) {

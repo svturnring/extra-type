@@ -1,4 +1,4 @@
-import { spawnSync } from "child_process"
+import { spawn, spawnSync } from "child_process"
 import { log } from "./logger.js"
 import type { InsertMethod } from "./types.js"
 
@@ -7,7 +7,7 @@ import type { InsertMethod } from "./types.js"
 // dotool drives /dev/uinput against the Xwayland layout, locked to "us" behind
 // Hyprland, so Cyrillic can never be typed and the ctrl+shift+u hex hack fails
 // in most apps. This sink speaks the Wayland virtual-keyboard via wtype and has
-// two insertion methods:
+// three insertion methods:
 //
 //   type (default): wtype types each character with its exact XKB keysym from a
 //     keymap that wtype builds itself and uploads with the virtual keyboard, so
@@ -18,6 +18,15 @@ import type { InsertMethod } from "./types.js"
 //     Limitation: native-Wayland apps get exact keysyms; XWayland/X11 apps
 //     (older Electron in X11 mode, wine, java) interpret the keycodes against
 //     their own keymap and can render garbage there.
+//
+//   dotool: types through /dev/uinput via the dotool server, which many apps
+//     (and compositors) treat as a real physical keyboard. English only:
+//     keysyms are resolved against the "us" layout, so the result matches the
+//     receiver only when the target app is on the (default) US layout. This is
+//     an experimental alternative to "type" for apps that mishandle the
+//     virtual-keyboard keymap (e.g. Chromium, Electron); it works even in
+//     XWayland apps and Google Chrome. Requires `dotool` installed and
+//     /dev/uinput access. No compositor/layout-detection dependency.
 //
 //   paste: wl-copy + wtype paste combo, so non-ASCII lands verbatim everywhere
 //     including XWayland. Costs clipboard history and depends on the app's paste
@@ -105,11 +114,70 @@ function pressKey(keyName: string): void {
 export interface DotoolSinkOptions {
     pasteCombo?: string
     method?: InsertMethod
+    /** xkb layout passed to dotool via DOTOOL_XKB_LAYOUT (e.g. "ru", "us"). */
+    dotoolXkbLayout?: string
+}
+
+interface DotoolProcSink extends DotoolSink {
+    readonly proc: ReturnType<typeof spawn> | null
+}
+
+// dotool server channel (types via /dev/uinput). English only: keysyms are
+// resolved against the "us" xkb layout, so Cyrillic/non-ASCII are dropped by
+// the receiver unless the target app is on the (default) US layout. Mirrors
+// nerd-dictation's DOTOOL backend: a persistent `dotool` process fed from stdin
+// so keymap/layout state survives between commands. The same binary is
+// validated by the preflight and is the daemon behind the `dotoolc` client/fifo
+// wrapper. No compositor/layout detection dependency (works on any compositor).
+function spawnDotoolProcSink(xkbLayout: string): DotoolProcSink {
+    let proc: ReturnType<typeof spawn> | null = null
+    try {
+        proc = spawn("dotool", [], {
+            stdio: ["pipe", "pipe", "pipe"],
+            env: { ...process.env, DOTOOL_XKB_LAYOUT: xkbLayout },
+        })
+        proc.stdin!.write("keydelay 4\nkeyhold 0\ntypedelay 12\ntypehold 0\n")
+    } catch (err) {
+        log("TYPE", `dotool spawn failed: ${err}`)
+        proc = null
+    }
+    return {
+        proc,
+        write(data: string) {
+            if (!proc) return
+            for (const line of data.split("\n")) {
+                const t = line.trim()
+                if (!t) continue
+                if (t.startsWith("type ")) {
+                    proc.stdin!.write(`type ${t.slice(5)}\n`)
+                } else if (t.startsWith("key ")) {
+                    const rest = t.slice(4).trim()
+                    if (rest === "BackSpace" || rest.startsWith("BackSpace")) {
+                        proc.stdin!.write("key backspace\n")
+                    } else if (rest === "enter") {
+                        proc.stdin!.write("key enter\n")
+                    }
+                }
+            }
+        },
+        get writable() {
+            return true
+        },
+        kill() {
+            if (proc) proc.kill("SIGTERM")
+            proc = null
+        },
+    }
 }
 
 export function spawnDotoolSink(options: DotoolSinkOptions = {}): DotoolSink {
     const pasteCombo = options.pasteCombo ?? DEFAULT_PASTE
     const method = options.method ?? DEFAULT_METHOD
+
+    if (method === "dotool") {
+        return spawnDotoolProcSink(options.dotoolXkbLayout ?? "us")
+    }
+
     return {
         write(data: string) {
             // each write() may contain multiple lines
