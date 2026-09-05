@@ -4,6 +4,8 @@ build
 bun.lock
 TODO.md
 releases
+checksums.txt
+extra-type-linux-*.tar.gz
 .cursor
 .env
 .env.*

@@ -607,6 +607,19 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_box_append(GTK_BOX(stream_box), GTK_WIDGET(g_stream_switch));
     gtk_box_append(GTK_BOX(stream_box), gtk_label_new("Live typing while dictating"));
 
+    GtkWidget *stream_note = gtk_label_new(
+        "Correct only in native Wayland apps; in Chrome and Electron\n"
+        "apps (Discord) live typing can garble or erase text.\n"
+        "For reliable input everywhere, turn Live typing off and use\n"
+        "Paste via clipboard, or use the Overlay mode instead.");
+    gtk_widget_set_halign(stream_note, GTK_ALIGN_START);
+    gtk_widget_add_css_class(stream_note, "auto-note");
+    PangoAttrList *stream_note_attrs = pango_attr_list_new();
+    pango_attr_list_insert(stream_note_attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+    gtk_label_set_attributes(GTK_LABEL(stream_note), stream_note_attrs);
+    pango_attr_list_unref(stream_note_attrs);
+    gtk_box_append(GTK_BOX(vbox), stream_note);
+
     /* Punctuation */
     GtkWidget *punct_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(vbox), punct_box);

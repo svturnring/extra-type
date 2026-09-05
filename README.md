@@ -39,6 +39,10 @@ extra-type stop     # stop the daemon
 
 Turn dictation on, speak, turn it off — the text is already in your app. Tune everything (language, hotkey, insertion mode, sounds) in `extra-type settings` or directly in `~/.config/extra-type.jsonc`.
 
+## Notes
+
+Live typing works correctly only in native Wayland apps. In Chrome and Electron apps (Discord and others) it can garble or erase the dictated text: unlike a terminal, the browser translates virtual-keyboard keycodes by its own active layout, so wtype's exact keysyms do not land. For reliable input in these apps, turn **Live typing off** and use **Paste via clipboard**, or use the **Overlay** mode instead.
+
 ## Update
 
 ```bash
