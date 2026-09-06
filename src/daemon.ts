@@ -16,6 +16,7 @@ import { Tray } from "./tray.js"
 import { updateVizState } from "./vizState.js"
 import { startVisualizer, stopVisualizer } from "./visualizer.js"
 import { startHotkeyDaemon, stopHotkeyDaemon } from "./hotkey.js"
+import { openSettingsWindow, closeSettingsWindow } from "./settingsLauncher.js"
 import SpeechPipeline from "./speechPipeline.js"
 import { shouldAcceptSpeechEvent } from "./speechEventGate.js"
 import type { SpeechEvent, ExtraTypeConfig } from "./types.js"
@@ -277,15 +278,7 @@ if (!body || typeof body !== "object") {
 
         this.app.get("/open-settings", async (req, res) => {
             res.send("ok")
-            try {
-                const { spawn } = await import("node:child_process")
-                spawn("extra-type-settings", [String(this.config.port)], {
-                    detached: true,
-                    stdio: "ignore",
-                }).unref()
-            } catch (e) {
-                log("DAEMON", `Failed to open settings: ${e}`)
-            }
+            openSettingsWindow(this.config.port)
         })
 
         this.app.get("/togglePunctuation", async (req, res) => {
@@ -661,15 +654,7 @@ if (!body || typeof body !== "object") {
     }
 
     private async openSettings() {
-        try {
-            const { spawn } = await import("node:child_process")
-            spawn("extra-type-settings", [String(this.config.port)], {
-                detached: true,
-                stdio: "ignore",
-            }).unref()
-        } catch (e) {
-            log("DAEMON", `Failed to open settings: ${e}`)
-        }
+        openSettingsWindow(this.config.port)
     }
 
     private syncHotkey() {
@@ -737,6 +722,7 @@ if (!body || typeof body !== "object") {
         this.typingController.destroy()
         stopVisualizer()
         stopHotkeyDaemon()
+        closeSettingsWindow()
 
         await Promise.race([
             Promise.all([
