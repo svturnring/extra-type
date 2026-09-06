@@ -155,6 +155,8 @@ static GtkDropDown *g_insert_dropdown = NULL;
 static GtkButton *g_paste_button = NULL;
 static char *g_paste_display = NULL;
 
+static GtkWidget *g_window = NULL; /* single settings window */
+
 static char *wire_to_display(const char *wire);
 static void update_hotkey_label(void);
 static void update_paste_label(void);
@@ -509,15 +511,75 @@ static gboolean on_capture_key(GtkEventControllerKey *controller, guint keyval,
 }
 
 /* ------------------------------------------------------------------ */
+/* UI helpers                                                          */
+/* ------------------------------------------------------------------ */
+static GtkWidget *make_page(void) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(box, 20);
+    gtk_widget_set_margin_end(box, 20);
+    gtk_widget_set_margin_top(box, 20);
+    gtk_widget_set_margin_bottom(box, 20);
+    return box;
+}
+
+static GtkWidget *make_title(const char *text) {
+    GtkWidget *lbl = gtk_label_new(text);
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    PangoAttrList *attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+    gtk_label_set_attributes(GTK_LABEL(lbl), attrs);
+    pango_attr_list_unref(attrs);
+    return lbl;
+}
+
+static GtkWidget *make_note(const char *text) {
+    GtkWidget *lbl = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(lbl), text);
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+    gtk_widget_set_hexpand(lbl, TRUE);
+    gtk_widget_add_css_class(lbl, "auto-note");
+    return lbl;
+}
+
+static GtkWidget *make_switch_row(GtkSwitch **out_switch, const char *key,
+                                  const char *label) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    *out_switch = GTK_SWITCH(gtk_switch_new());
+    /* key is always a static string literal, safe as user_data */
+    g_signal_connect(*out_switch, "notify::active", G_CALLBACK(on_bool_changed),
+                     (gpointer)key);
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(*out_switch));
+
+    GtkWidget *lblw = gtk_label_new(label);
+    gtk_label_set_wrap(GTK_LABEL(lblw), TRUE);
+    gtk_box_append(GTK_BOX(box), lblw);
+    return box;
+}
+
+static void on_window_destroyed(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    GtkWidget **win = (GtkWidget **)data;
+    *win = NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* Activate                                                            */
 /* ------------------------------------------------------------------ */
 static void activate(GtkApplication *app, gpointer user_data) {
     (void)user_data;
 
+    /* single-instance: a second activation must just raise the existing
+     * window instead of creating another one */
+    if (g_window) {
+        gtk_window_present(GTK_WINDOW(g_window));
+        return;
+    }
+
     GtkWidget *win = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(win), "Extra Type - Settings");
-    gtk_window_set_default_size(GTK_WINDOW(win), 400, 620);
-    gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
+    gtk_window_set_default_size(GTK_WINDOW(win), 540, 560);
+    gtk_window_set_resizable(GTK_WINDOW(win), FALSE); /* fixed width/height */
 
     GtkEventController *hk_ctrl = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(hk_ctrl, GTK_PHASE_CAPTURE);
@@ -527,25 +589,27 @@ static void activate(GtkApplication *app, gpointer user_data) {
     GdkDisplay *disp = gdk_display_get_default();
     GtkCssProvider *css = gtk_css_provider_new();
     gtk_css_provider_load_from_string(css,
-        ".auto-note { color: alpha(@theme_fg_color, 0.75); }\n");
+        ".auto-note { color: alpha(@theme_fg_color, 0.75); }\n"
+        "notebook { border: none; }\n"
+        "notebook > header { background: alpha(@theme_bg_color, 0.4); }\n");
     gtk_style_context_add_provider_for_display(disp,
         GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_set_margin_start(vbox, 20);
-    gtk_widget_set_margin_end(vbox, 20);
-    gtk_widget_set_margin_top(vbox, 20);
-    gtk_widget_set_margin_bottom(vbox, 20);
-    gtk_window_set_child(GTK_WINDOW(win), vbox);
+    /* root: notebook on top, always-visible status line below */
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-    /* Language */
-    GtkWidget *lang_label = gtk_label_new("Language");
-    gtk_widget_set_halign(lang_label, GTK_ALIGN_START);
-    PangoAttrList *lang_attrs = pango_attr_list_new();
-    pango_attr_list_insert(lang_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-    gtk_label_set_attributes(GTK_LABEL(lang_label), lang_attrs);
-    pango_attr_list_unref(lang_attrs);
-    gtk_box_append(GTK_BOX(vbox), lang_label);
+    GtkWidget *nb = gtk_notebook_new();
+    gtk_notebook_set_show_border(GTK_NOTEBOOK(nb), FALSE);
+    gtk_notebook_set_tab_pos(GTK_NOTEBOOK(nb), GTK_POS_TOP);
+    gtk_notebook_set_scrollable(GTK_NOTEBOOK(nb), FALSE);
+    gtk_widget_set_hexpand(nb, TRUE);
+    gtk_widget_set_vexpand(nb, TRUE);
+    gtk_box_append(GTK_BOX(root), nb);
+
+    /* ================= General ================= */
+    GtkWidget *gen = make_page();
+
+    gtk_box_append(GTK_BOX(gen), make_title("Language"));
 
     GtkStringList *lang_list = gtk_string_list_new(NULL);
     for (int i = 0; LANG_LABELS[i]; i++) {
@@ -553,155 +617,36 @@ static void activate(GtkApplication *app, gpointer user_data) {
         snprintf(label, sizeof(label), "%s  (%s)", LANG_LABELS[i], LANG_CODES[i]);
         gtk_string_list_append(lang_list, label);
     }
-
     g_lang_dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(lang_list), NULL));
     gtk_widget_set_hexpand(GTK_WIDGET(g_lang_dropdown), TRUE);
     g_signal_connect(g_lang_dropdown, "notify::selected", G_CALLBACK(on_lang_changed), NULL);
-    gtk_box_append(GTK_BOX(vbox), GTK_WIDGET(g_lang_dropdown));
+    gtk_box_append(GTK_BOX(gen), GTK_WIDGET(g_lang_dropdown));
 
-    /* Auto-detect */
-    GtkWidget *auto_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(vbox), auto_box);
+    gtk_box_append(GTK_BOX(gen),
+        make_switch_row(&g_stream_switch, "stream", "Live typing while dictating"));
+    gtk_box_append(GTK_BOX(gen),
+        make_note("<small>Correct only in native Wayland apps; in Chrome and Electron "
+                  "apps (Discord) live typing can garble or erase text. "
+                  "For reliable input everywhere, turn Live typing off and use "
+                  "Paste via clipboard, or use the Overlay mode instead.</small>"));
 
-    g_autodetect_switch = GTK_SWITCH(gtk_switch_new());
-    g_signal_connect(g_autodetect_switch, "notify::active", G_CALLBACK(on_bool_changed), "autodetect_lang");
-    gtk_box_append(GTK_BOX(auto_box), GTK_WIDGET(g_autodetect_switch));
+    gtk_box_append(GTK_BOX(gen), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
-    GtkWidget *auto_label = gtk_label_new("Auto-detect keyboard layout");
-    gtk_box_append(GTK_BOX(auto_box), auto_label);
-
-    GtkWidget *auto_note = gtk_label_new(
-        "Works on Hyprland, Sway and X11/Xwayland systems. Other\n"
-        "compositors keep the selected language.");
-    gtk_widget_set_halign(auto_note, GTK_ALIGN_START);
-    gtk_widget_add_css_class(auto_note, "auto-note");
-    PangoAttrList *auto_note_attrs = pango_attr_list_new();
-    pango_attr_list_insert(auto_note_attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
-    gtk_label_set_attributes(GTK_LABEL(auto_note), auto_note_attrs);
-    pango_attr_list_unref(auto_note_attrs);
-    gtk_box_append(GTK_BOX(vbox), auto_note);
-
-    /* Separator */
-    gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-
-    /* Notifications */
-    GtkWidget *notif_label = gtk_label_new("Sound");
-    gtk_widget_set_halign(notif_label, GTK_ALIGN_START);
-    PangoAttrList *notif_attrs = pango_attr_list_new();
-    pango_attr_list_insert(notif_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-    gtk_label_set_attributes(GTK_LABEL(notif_label), notif_attrs);
-    pango_attr_list_unref(notif_attrs);
-    gtk_box_append(GTK_BOX(vbox), notif_label);
-
-    /* Sound */
-    GtkWidget *sound_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(vbox), sound_box);
-    g_sound_switch = GTK_SWITCH(gtk_switch_new());
-    g_signal_connect(g_sound_switch, "notify::active", G_CALLBACK(on_bool_changed), "sound");
-    gtk_box_append(GTK_BOX(sound_box), GTK_WIDGET(g_sound_switch));
-    gtk_box_append(GTK_BOX(sound_box), gtk_label_new("Play sounds on start and stop"));
-
-    /* Live typing (stream) */
-    GtkWidget *stream_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(vbox), stream_box);
-    g_stream_switch = GTK_SWITCH(gtk_switch_new());
-    g_signal_connect(g_stream_switch, "notify::active", G_CALLBACK(on_bool_changed), "stream");
-    gtk_box_append(GTK_BOX(stream_box), GTK_WIDGET(g_stream_switch));
-    gtk_box_append(GTK_BOX(stream_box), gtk_label_new("Live typing while dictating"));
-
-    GtkWidget *stream_note = gtk_label_new(
-        "Correct only in native Wayland apps; in Chrome and Electron\n"
-        "apps (Discord) live typing can garble or erase text.\n"
-        "For reliable input everywhere, turn Live typing off and use\n"
-        "Paste via clipboard, or use the Overlay mode instead.");
-    gtk_widget_set_halign(stream_note, GTK_ALIGN_START);
-    gtk_widget_add_css_class(stream_note, "auto-note");
-    PangoAttrList *stream_note_attrs = pango_attr_list_new();
-    pango_attr_list_insert(stream_note_attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
-    gtk_label_set_attributes(GTK_LABEL(stream_note), stream_note_attrs);
-    pango_attr_list_unref(stream_note_attrs);
-    gtk_box_append(GTK_BOX(vbox), stream_note);
-
-    /* Punctuation */
-    GtkWidget *punct_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(vbox), punct_box);
-    g_punctuation_switch = GTK_SWITCH(gtk_switch_new());
-    g_signal_connect(g_punctuation_switch, "notify::active", G_CALLBACK(on_bool_changed), "punctuation");
-    gtk_box_append(GTK_BOX(punct_box), GTK_WIDGET(g_punctuation_switch));
-    gtk_box_append(GTK_BOX(punct_box), gtk_label_new("Spoken punctuation (English)"));
-
-    /* Separator */
-    gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-
-    /* Timeout */
-    GtkWidget *timeout_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(vbox), timeout_box);
-    gtk_box_append(GTK_BOX(timeout_box), gtk_label_new("Silence timeout (seconds):"));
-    g_timeout_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 300, 1));
-    g_signal_connect(g_timeout_spin, "notify::value", G_CALLBACK(on_timeout_changed), NULL);
-    gtk_box_append(GTK_BOX(timeout_box), GTK_WIDGET(g_timeout_spin));
-
-    /* Separator */
-    gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-
-    /* Global hotkey */
-    GtkWidget *hk_label = gtk_label_new("Global hotkey");
-    gtk_widget_set_halign(hk_label, GTK_ALIGN_START);
-    PangoAttrList *hk_attrs = pango_attr_list_new();
-    pango_attr_list_insert(hk_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-    gtk_label_set_attributes(GTK_LABEL(hk_label), hk_attrs);
-    pango_attr_list_unref(hk_attrs);
-    gtk_box_append(GTK_BOX(vbox), hk_label);
-
-    GtkWidget *hk_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(vbox), hk_box);
-
-    g_hotkey_button = GTK_BUTTON(gtk_button_new_with_label("Not set"));
-    gtk_widget_set_hexpand(GTK_WIDGET(g_hotkey_button), TRUE);
-    g_signal_connect(g_hotkey_button, "clicked", G_CALLBACK(begin_capture), NULL);
-    gtk_box_append(GTK_BOX(hk_box), GTK_WIDGET(g_hotkey_button));
-
-    GtkWidget *hk_clear_btn = gtk_button_new_with_label("Clear");
-    g_signal_connect(hk_clear_btn, "clicked", G_CALLBACK(clear_hotkey), NULL);
-    gtk_box_append(GTK_BOX(hk_box), hk_clear_btn);
-
-    GtkWidget *hk_note = gtk_label_new(
-        "Toggles start/stop globally, in any session (tty, X11, Wayland).\n"
-        "Clear it to use your compositor's own hotkey instead.\n"
-        "Requires access to /dev/uinput (user in the 'input' group).");
-    gtk_widget_set_halign(hk_note, GTK_ALIGN_START);
-    gtk_widget_add_css_class(hk_note, "auto-note");
-    PangoAttrList *hk_note_attrs = pango_attr_list_new();
-    pango_attr_list_insert(hk_note_attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
-    gtk_label_set_attributes(GTK_LABEL(hk_note), hk_note_attrs);
-    pango_attr_list_unref(hk_note_attrs);
-    gtk_box_append(GTK_BOX(vbox), hk_note);
-
-    /* Separator */
-    gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-
-    /* Text insertion */
-    GtkWidget *ins_label = gtk_label_new("Text insertion");
-    gtk_widget_set_halign(ins_label, GTK_ALIGN_START);
-    PangoAttrList *ins_attrs = pango_attr_list_new();
-    pango_attr_list_insert(ins_attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
-    gtk_label_set_attributes(GTK_LABEL(ins_label), ins_attrs);
-    pango_attr_list_unref(ins_attrs);
-    gtk_box_append(GTK_BOX(vbox), ins_label);
+    gtk_box_append(GTK_BOX(gen), make_title("Insertion mode"));
 
     GtkStringList *ins_list = gtk_string_list_new(NULL);
-    gtk_string_list_append(ins_list, "Type characters (no clipboard)");
-    gtk_string_list_append(ins_list, "Paste via clipboard");
-    gtk_string_list_append(ins_list, "Collect into overlay (copy anywhere)");
-    gtk_string_list_append(ins_list, "Dotool (uinput) - English layout only");
+    gtk_string_list_append(ins_list, "Virtual keyboard - Wayland apps only");
+    gtk_string_list_append(ins_list, "Paste via shortcut");
+    gtk_string_list_append(ins_list, "Overlay mode - works everywhere");
+    gtk_string_list_append(ins_list, "Hardware keyboard - English only");
     g_insert_dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(ins_list), NULL));
     gtk_drop_down_set_selected(g_insert_dropdown, 0);
     gtk_widget_set_hexpand(GTK_WIDGET(g_insert_dropdown), TRUE);
     g_signal_connect(g_insert_dropdown, "notify::selected", G_CALLBACK(on_insert_changed), NULL);
-    gtk_box_append(GTK_BOX(vbox), GTK_WIDGET(g_insert_dropdown));
+    gtk_box_append(GTK_BOX(gen), GTK_WIDGET(g_insert_dropdown));
 
     GtkWidget *paste_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(vbox), paste_box);
+    gtk_box_append(GTK_BOX(gen), paste_box);
 
     g_paste_button = GTK_BUTTON(gtk_button_new_with_label("Not set"));
     gtk_widget_set_hexpand(GTK_WIDGET(g_paste_button), TRUE);
@@ -712,32 +657,82 @@ static void activate(GtkApplication *app, gpointer user_data) {
     g_signal_connect(paste_clear_btn, "clicked", G_CALLBACK(clear_paste), NULL);
     gtk_box_append(GTK_BOX(paste_box), paste_clear_btn);
 
-    GtkWidget *ins_note = gtk_label_new(
-        "Typing types each character directly - no clipboard history\n"
-        "pollution and works in any app that accepts keystrokes (vim, terminals).\n"
-        "Native-Wayland apps get exact letters regardless of layout.\n"
-        "Paste is a fallback for XWayland/X11 apps; set the combo to your app's\n"
-        "paste binding (default Ctrl+V, reset with Clear).\n"
-        "Overlay mode works everywhere: the transcript collects into the pill\n"
-        "and you copy it out (button) and paste where you like.\n"
-        "Dotool types via uinput (needs dotool and /dev/uinput access, works in\n"
-        "XWayland apps and Chrome). English only; language is set to English and\n"
-        "the system layout must be US/English for correct output.");
-    gtk_widget_set_halign(ins_note, GTK_ALIGN_START);
-    gtk_widget_add_css_class(ins_note, "auto-note");
-    PangoAttrList *ins_note_attrs = pango_attr_list_new();
-    pango_attr_list_insert(ins_note_attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
-    gtk_label_set_attributes(GTK_LABEL(ins_note), ins_note_attrs);
-    pango_attr_list_unref(ins_note_attrs);
-    gtk_box_append(GTK_BOX(vbox), ins_note);
+    gtk_box_append(GTK_BOX(gen),
+        make_note("<small>• <b>Virtual keyboard</b> mode may work incorrectly in such "
+                  "applications as Google Chrome, Discord and other Electron/Tauri "
+                  "applications. You can try to use <b>Paste via shortcut</b> mode instead "
+                  "or <b>Overlay</b> mode as the most stable option.\n"
+                  "• <b>Hardware keyboard</b> mode works quite stably everywhere, as it "
+                  "emulates physical keyboard presses, but cannot work with multilingual "
+                  "input since it directly depends on the current keyboard layout.</small>"));
 
-    /* Separator */
-    gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+    /* ================= Other ================= */
+    GtkWidget *oth = make_page();
+
+    gtk_box_append(GTK_BOX(oth),
+        make_switch_row(&g_autodetect_switch, "autodetect_lang", "Auto-detect keyboard layout"));
+    gtk_box_append(GTK_BOX(oth),
+        make_note("<small>Works on Hyprland, Sway and X11/Xwayland systems. Other "
+                  "compositors keep the selected language.</small>"));
+
+    gtk_box_append(GTK_BOX(oth), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+
+    gtk_box_append(GTK_BOX(oth), make_title("Sound"));
+    gtk_box_append(GTK_BOX(oth),
+        make_switch_row(&g_sound_switch, "sound", "Play sounds on start and stop"));
+
+    gtk_box_append(GTK_BOX(oth),
+        make_switch_row(&g_punctuation_switch, "punctuation", "Spoken punctuation (English)"));
+
+    gtk_box_append(GTK_BOX(oth), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+
+    gtk_box_append(GTK_BOX(oth), make_title("Global hotkey"));
+
+    GtkWidget *hk_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(oth), hk_box);
+
+    g_hotkey_button = GTK_BUTTON(gtk_button_new_with_label("Not set"));
+    gtk_widget_set_hexpand(GTK_WIDGET(g_hotkey_button), TRUE);
+    g_signal_connect(g_hotkey_button, "clicked", G_CALLBACK(begin_capture), NULL);
+    gtk_box_append(GTK_BOX(hk_box), GTK_WIDGET(g_hotkey_button));
+
+    GtkWidget *hk_clear_btn = gtk_button_new_with_label("Clear");
+    g_signal_connect(hk_clear_btn, "clicked", G_CALLBACK(clear_hotkey), NULL);
+    gtk_box_append(GTK_BOX(hk_box), hk_clear_btn);
+
+    gtk_box_append(GTK_BOX(oth),
+        make_note("<small>Toggles start/stop globally, in any session (tty, X11, Wayland).\n"
+                  "Clear it to use your compositor's own hotkey instead.\n"
+                  "Requires access to /dev/uinput (user in the 'input' group).</small>"));
+
+    gtk_box_append(GTK_BOX(oth), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+
+    gtk_box_append(GTK_BOX(oth), make_title("Silence timeout"));
+
+    GtkWidget *timeout_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(oth), timeout_box);
+    gtk_box_append(GTK_BOX(timeout_box), gtk_label_new("Stop after silence (seconds):"));
+    g_timeout_spin = GTK_SPIN_BUTTON(gtk_spin_button_new_with_range(0, 300, 1));
+    g_signal_connect(g_timeout_spin, "notify::value", G_CALLBACK(on_timeout_changed), NULL);
+    gtk_box_append(GTK_BOX(timeout_box), GTK_WIDGET(g_timeout_spin));
+
+    gtk_notebook_append_page(GTK_NOTEBOOK(nb), gen,
+        gtk_label_new("General"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(nb), oth,
+        gtk_label_new("Other"));
 
     /* Status (errors only; plain success shows nothing) */
     g_status_label = GTK_LABEL(gtk_label_new(""));
     gtk_widget_set_halign(GTK_WIDGET(g_status_label), GTK_ALIGN_START);
-    gtk_box_append(GTK_BOX(vbox), GTK_WIDGET(g_status_label));
+    gtk_widget_set_margin_start(GTK_WIDGET(g_status_label), 20);
+    gtk_widget_set_margin_end(GTK_WIDGET(g_status_label), 20);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(g_status_label), 10);
+    gtk_box_append(GTK_BOX(root), GTK_WIDGET(g_status_label));
+
+    gtk_window_set_child(GTK_WINDOW(win), root);
+
+    g_signal_connect(win, "destroy", G_CALLBACK(on_window_destroyed), &g_window);
+    g_window = win;
 
     gtk_window_present(GTK_WINDOW(win));
 
