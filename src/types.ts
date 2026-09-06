@@ -3,6 +3,8 @@ import type { WSA_LANGUAGES } from "./constants.js"
 
 export type Urgency = "low" | "normal" | "critical"
 
+export type VizStatus = "listening" | "starting" | "recovering" | "error" | "offline" | "idle"
+
 export type InsertMethod = "type" | "paste" | "pill" | "dotool"
 
 export type WSALanguage = (typeof WSA_LANGUAGES)[keyof typeof WSA_LANGUAGES]

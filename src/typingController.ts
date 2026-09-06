@@ -67,6 +67,23 @@ export default class TypingController {
         if (this.onPillText) this.onPillText("")
     }
 
+    /**
+     * Call AFTER a browser / WSA restart while still listening. The Web Speech
+     * session was interrupted, so the previously-typed interim text on screen
+     * can no longer be edited by diffing against new partials — otherwise the
+     * first partial after the restart would backspace over it all. Keep what is
+     * already on screen (it is already typed), stop tracking it as editable,
+     * and for pill mode fold the interrupted interim into the finalized
+     * transcript so nothing is lost.
+     */
+    public recoverRestart() {
+        if (this.insertMethod === "pill" && this.prevText) {
+            this.accFinal += this.prevText
+            if (this.onPillText) this.onPillText(this.pillText())
+        }
+        this.prevText = ""
+    }
+
     /** Replace the pill transcript from the overlay (user edits in the viz). */
     public setPillText(text: string) {
         if (this.insertMethod !== "pill") return

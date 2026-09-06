@@ -1,8 +1,42 @@
-// Injected into Chrome via page.evaluate — no imports. Helpers used by evaluated
-// functions must be nested inside them (Puppeteer only serializes the top-level export).
+// Injected into Chrome via page.evaluate — no imports. IMPORTANT: Puppeteer only
+// serializes the top-level exported function plus whatever is defined INSIDE it
+// (and the closures of the nested functions). Anything declared at module scope
+// (constants, helper functions) is NOT available in the page context. So all
+// logic + constants used by a function that gets page.evaluate()-d must be
+// defined inside that function's body. This file is the SINGLE source of truth;
+// the same constants/logic are mirrored as literals inside the injected
+// functions below (duplicated deliberately, not via module-scope helpers).
 // Event mapper: keep browserRecognition.js in sync (tests/browserRecognition.sync.test.ts).
 
+// Module-scope helpers exist ONLY for standalone unit tests
+// (tests/browserErrors.sync.test.ts). They are NOT called from the injected
+// functions — the injected functions carry their own copies (see below).
+export function isFatalError(code) {
+    return new Set(["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported", "bad-grammar"]).has(code)
+}
+
+export function shouldEscalateRestarts(restartCount, lastRestartAt, now) {
+    const MAX_RESTARTS = 3
+    const RESTART_WINDOW_MS = 30000
+    return restartCount >= MAX_RESTARTS && (now - lastRestartAt) < RESTART_WINDOW_MS
+}
+
 export function initWSA(stream, lang) {
+    // Self-contained copies for the page context (see header comment).
+    const FATAL_ERRORS = new Set([
+        "not-allowed",
+        "service-not-allowed",
+        "audio-capture",
+        "language-not-supported",
+        "bad-grammar",
+    ])
+    const RESTART_WINDOW_MS = 30000
+    const MAX_RESTARTS = 3
+
+    const isFatalError = (code) => FATAL_ERRORS.has(code)
+    const shouldEscalateRestarts = (restartCount, lastRestartAt, now) =>
+        restartCount >= MAX_RESTARTS && (now - lastRestartAt) < RESTART_WINDOW_MS
+
     function recognitionResultsToEvents(stream, resultIndex, results) {
         let interimText = ""
         let finalizedText = ""
@@ -54,23 +88,41 @@ export function initWSA(stream, lang) {
     }
     rec.lang = lang !== undefined ? lang : "en-US"
 
-    // A single delayed restart path. Chrome's stop() is async, so calling
-    // start() right after stop() throws "recognition has already started".
-    // onerror and onend both funnel into this one timer instead of racing.
+    window.__recState = {
+        running: false,
+        resultAt: 0,
+        lastError: null,
+        lastErrorAt: 0,
+        restartCount: 0,
+        lastRestartAt: 0,
+    }
+
     let restartTimer = 0
     const scheduleRestart = () => {
         if (restartTimer) return
         restartTimer = setTimeout(() => {
             restartTimer = 0
             if (!window.__shouldRun || window.__stopRequested || window.isOffline) return
-            // Stamp activity so a health check in this window never sees a stale
-            // engine; the daemon would otherwise reinitialize the whole browser.
-            window.__lastAudioAt = Date.now()
-            window.__lastResultAt = Date.now()
+            const now = Date.now()
+            const rs = window.__recState
+            if (shouldEscalateRestarts(rs.restartCount, rs.lastRestartAt, now)) {
+                console.error(`recognition: too many restarts (${rs.restartCount}) in ${RESTART_WINDOW_MS}ms — escalating`)
+                rs.running = false
+                if (window.onBrowserRecError) {
+                    window.onBrowserRecError({ code: "too-many-restarts", message: "Recognition restarted too many times without success" })
+                }
+                return
+            }
+            rs.lastRestartAt = now
+            rs.restartCount++
             try {
                 rec.start()
             } catch (e) {
                 console.error(`Error restarting rec: ${e.message || e}`)
+                rs.running = false
+                if (window.onBrowserRecError) {
+                    window.onBrowserRecError({ code: "restart-failed", message: e.message || String(e) })
+                }
             }
         }, 500)
     }
@@ -78,6 +130,8 @@ export function initWSA(stream, lang) {
     rec.onstart = () => {
         console.log("Listening...")
         rec.isRunning = true
+        window.__recState.running = true
+        window.__recState.restartCount = 0
         window.__lastAudioAt = Date.now()
         window.__lastResultAt = Date.now()
     }
@@ -85,6 +139,7 @@ export function initWSA(stream, lang) {
     rec.onresult = (event) => {
         window.__lastAudioAt = Date.now()
         window.__lastResultAt = Date.now()
+        window.__recState.resultAt = Date.now()
         const events = recognitionResultsToEvents(stream, event.resultIndex, event.results)
         for (const speechEvent of events) {
             window.onSpeechEvent(speechEvent)
@@ -108,15 +163,27 @@ export function initWSA(stream, lang) {
             window.isOffline = true
             return
         }
-        // Transient errors (no speech, aborted, audio capture, permission) must
-        // not kill the daemon. Defer to the scheduled restart instead of an
-        // inline stop()+start(), which races Chrome's async stop().
-        console.error(`recognition error: ${event.error} - scheduling restart`)
-        scheduleRestart()
+        const rs = window.__recState
+        rs.lastError = event.error
+        rs.lastErrorAt = Date.now()
+        if (isFatalError(event.error)) {
+            console.error(`recognition FATAL error: ${event.error}`)
+            rs.running = false
+            if (window.onBrowserRecError) {
+                window.onBrowserRecError({ code: event.error, message: event.message || event.error })
+            }
+            if (window.onBrowserRecStop) {
+                window.onBrowserRecStop({ reason: "error" })
+            }
+        } else {
+            console.error(`recognition error: ${event.error} - scheduling restart`)
+            scheduleRestart()
+        }
     }
 
     rec.onend = () => {
         rec.isRunning = false
+        window.__recState.running = false
         window.isOffline = undefined
         if (window.__stopRequested) {
             window.__stopRequested = false
@@ -126,9 +193,14 @@ export function initWSA(stream, lang) {
             window.__shouldRun = false
             window.onBrowserRecStop({ reason: "offline" })
         } else if (window.__shouldRun) {
-            // Chrome ends a continuous session on its own (e.g. after a pause or
-            // a foreign-language word). Restart so dictation keeps going instead
-            // of shutting the whole daemon down.
+            /* Chrome ended the continuous session on its own (pause,
+             * unheard fragment). We're about to silently restart inside the
+             * page — tell the daemon so it can stop diffing the stale interim,
+             * or the first partial of the new session would backspace over the
+             * text already dictated. */
+            if (window.onBrowserRecRestart) {
+                window.onBrowserRecRestart()
+            }
             scheduleRestart()
         } else {
             window.onBrowserRecStop({ reason: "silence" })
@@ -197,14 +269,12 @@ export function stopRecognition() {
 
 export function healthCheck() {
     const rec = window.recognition
-    if (!rec) return "no-recognition"
-    if (!rec.isRunning) return "idle"
-    // A running engine that has produced no audio / results for 20s is hung,
-    // not quiet: Chrome's continuous mode re-arms and fires audio events when
-    // it hears something, so truly silent pauses still end the timer. This is
-    // what lets the daemon's watchdog recover a dead engine without a manual
-    // double-press, and makes the pill flash loading/error during recovery.
-    const last = Math.max(window.__lastAudioAt || 0, window.__lastResultAt || 0)
-    if (Date.now() - last > 20000) return "stalled"
-    return "listening"
+    if (!rec) return { state: "no-recognition", lastError: null, restartCount: 0 }
+    const rs = window.__recState || { lastError: null, restartCount: 0 }
+    if (rs.lastError) return { state: "error", lastError: rs.lastError, restartCount: rs.restartCount }
+    if (!rec.isRunning) return { state: "idle", lastError: null, restartCount: rs.restartCount }
+    const last = Math.max(window.__lastAudioAt || 0, window.__lastResultAt || 0, rs.resultAt || 0)
+    const STALL_TIMEOUT_MS = 10000
+    if (Date.now() - last > STALL_TIMEOUT_MS) return { state: "stalled", lastError: null, restartCount: rs.restartCount }
+    return { state: "listening", lastError: null, restartCount: rs.restartCount }
 }

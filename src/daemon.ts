@@ -19,7 +19,7 @@ import { startHotkeyDaemon, stopHotkeyDaemon } from "./hotkey.js"
 import { openSettingsWindow, closeSettingsWindow } from "./settingsLauncher.js"
 import SpeechPipeline from "./speechPipeline.js"
 import { shouldAcceptSpeechEvent } from "./speechEventGate.js"
-import type { SpeechEvent, ExtraTypeConfig } from "./types.js"
+import type { SpeechEvent, ExtraTypeConfig, VizStatus } from "./types.js"
 
 export default class Daemon {
     private readonly config: ExtraTypeConfig
@@ -343,7 +343,7 @@ if (!body || typeof body !== "object") {
         this.tray.listening = true
         this.typingController.hasStopped = false
         this.notifier.notifyMicStart()
-        updateVizState({ listening: true, lang, error: null, loading: false })
+        updateVizState({ listening: true, lang, error: null, loading: false, status: "listening" })
 
         if (this.config.stream && this.config.timeout > 0) {
             this.resetSilenceTimer()
@@ -362,17 +362,17 @@ if (!body || typeof body !== "object") {
         this.browser = null
         this.page = null
         this.isWSAListening = false
-        updateVizState({ loading: true, error: null })
+        updateVizState({ loading: true, error: null, status: "starting" })
         try {
             await this.initBrowser()
-            updateVizState({ listening: false, loading: false, error: null })
+            updateVizState({ listening: false, loading: false, error: null, status: "idle" })
         } catch (e) {
-            updateVizState({ loading: false, error: "Browser restart failed" })
+            updateVizState({ loading: false, error: "Browser restart failed", status: "error", message: "Browser restart failed" })
             throw e
         }
     }
 
-    private async stopTranscription(reason: "intentional" | "offline" | "silence", res?: Response) {
+    private async stopTranscription(reason: "intentional" | "offline" | "silence" | "error", res?: Response) {
         if (this.stopCooldown) {
             log("DAEMON", `Stop request ignored - still in cooldown period (reason: ${reason})`)
             res?.status(429).send("Cooldown active")
@@ -404,7 +404,7 @@ if (!body || typeof body !== "object") {
             updateVizState({ dictationText: "", pillDirty: false })
         }
         this.typingController.reset()
-        updateVizState({ listening: false, error: null, loading: false })
+        updateVizState({ listening: false, error: null, loading: false, status: "idle" })
 
         if (reason === "intentional") {
             this.notifier.notifyMicStopIntentional()
@@ -412,6 +412,8 @@ if (!body || typeof body !== "object") {
             this.notifier.notifyMicStopSilence()
         } else if (reason === "offline") {
             this.notifier.notifyOffline()
+        } else if (reason === "error") {
+            this.notifier.notifyError("Recognition stopped due to error")
         }
 
         this.stopCooldown = true
@@ -454,7 +456,7 @@ if (!body || typeof body !== "object") {
                     next()
                 } catch (e2) {
                     log("DAEMON", `Browser reinitialization failed: ${e2}`)
-                    updateVizState({ error: "Browser reinitialization failed", loading: false })
+                    updateVizState({ error: "Browser reinitialization failed", loading: false, status: "error", message: "Browser reinitialization failed" })
                     res.status(503).send("Browser reinitialization failed")
                 }
             }
@@ -469,7 +471,7 @@ if (!body || typeof body !== "object") {
             await this.runRecovery()
             return
         }
-        let health: string
+        let health: { state: string; lastError: string | null; restartCount: number }
         try {
             health = await this.page!.evaluate(browser.healthCheck)
         } catch (e) {
@@ -477,20 +479,29 @@ if (!body || typeof body !== "object") {
             await this.runRecovery()
             return
         }
-        if (health === "no-recognition") {
+        if (health.state === "no-recognition") {
             log("DAEMON", "Watchdog: recognition missing while listening")
             await this.runRecovery()
             return
         }
-        if (health === "stalled") {
+        if (health.state === "error") {
+            log("DAEMON", `Watchdog: recognition error — ${health.lastError}`)
+            this.setStatus("error", health.lastError ?? "Unknown error")
+            this.tray.listening = false
+            this.isWSAListening = false
+            updateVizState({ listening: false })
+            await this.notifier.notifyError(`Recognition error: ${health.lastError}`)
+            return
+        }
+        if (health.state === "stalled") {
             if (!this.stallFastRetried) {
-                // Cheap in-place WSA restart first; only escalate to a full
-                // browser reinit if the engine is still dead on the next tick.
                 this.stallFastRetried = true
-                log("DAEMON", "Watchdog: recognition hung - fast in-place restart")
+                log("DAEMON", "Watchdog: recognition hung — fast in-place restart")
+                this.setStatus("recovering", "Recovering…")
                 updateVizState({ loading: true, error: null })
                 try {
                     await this.page!.evaluate(browser.setLangAndStart, this.currentLang)
+                    this.setStatus("listening")
                     updateVizState({ listening: true, error: null, loading: false })
                 } catch (e) {
                     log("DAEMON", `Watchdog: fast restart failed: ${e}`)
@@ -500,16 +511,24 @@ if (!body || typeof body !== "object") {
                 return
             }
             this.stallFastRetried = false
-            log("DAEMON", "Watchdog: recognition still hung - full browser restart")
+            log("DAEMON", "Watchdog: recognition still hung — full browser restart")
             await this.runRecovery()
             return
         }
-        if (health === "listening") {
+        if (health.state === "listening") {
             this.stallFastRetried = false
             return
         }
-        if (health === "idle") {
-            // Chrome may be between auto-restarts; give it a beat before acting.
+        if (health.state === "idle") {
+            if (health.lastError) {
+                log("DAEMON", `Watchdog: idle with error — ${health.lastError}`)
+                this.setStatus("error", health.lastError)
+                this.isWSAListening = false
+                this.tray.listening = false
+                updateVizState({ listening: false })
+                await this.notifier.notifyError(`Recognition error: ${health.lastError}`)
+                return
+            }
             await new Promise((r) => setTimeout(r, 1500))
             if (!this.isWSAListening || this.recovering) return
             try {
@@ -519,8 +538,8 @@ if (!body || typeof body !== "object") {
                 await this.runRecovery()
                 return
             }
-            if (health === "listening") return
-            log("DAEMON", "Watchdog: recognition stuck idle while listening - restarting")
+            if (health.state === "listening") return
+            log("DAEMON", "Watchdog: recognition stuck idle while listening — restarting")
             await this.runRecovery()
         }
     }
@@ -537,6 +556,11 @@ if (!body || typeof body !== "object") {
     /** Restart the browser page and resume recognition, feeding the pill states. */
     private async recoverBrowserWhileListening(): Promise<boolean> {
         log("DAEMON", "Recovering browser while listening...")
+        /* the WSA session is being rebuilt; the on-screen interim can no longer
+         * be diffed against new partials — fold it away so the first partial
+         * after the restart doesn't wipe the already-dictated text */
+        this.typingController.recoverRestart()
+        this.setStatus("recovering", "Recovering…")
         updateVizState({ loading: true, error: null })
         try {
             await this.reinitBrowser()
@@ -544,7 +568,7 @@ if (!body || typeof body !== "object") {
             log("DAEMON", `Browser reinit failed while listening: ${e}`)
             this.isWSAListening = false
             this.tray.listening = false
-            updateVizState({ error: "Recognition unavailable", listening: false, loading: false })
+            updateVizState({ error: "Recognition unavailable", listening: false, loading: false, status: "error", message: "Recognition unavailable" })
             await this.notifier.notifyOffline()
             return false
         }
@@ -553,13 +577,14 @@ if (!body || typeof body !== "object") {
         try {
             await this.page!.evaluate(browser.setLangAndStart, this.currentLang)
             this.stallFastRetried = false
+            this.setStatus("listening")
             updateVizState({ listening: true, error: null, loading: false })
             log("DAEMON", "Recognition resumed after restart")
         } catch (e) {
             log("DAEMON", `Failed to resume recognition: ${e}`)
             this.isWSAListening = false
             this.tray.listening = false
-            updateVizState({ error: "Recognition failed", listening: false, loading: false })
+            updateVizState({ error: "Recognition failed", listening: false, loading: false, status: "error", message: "Recognition failed" })
             await this.notifier.notifyOffline()
             return false
         }
@@ -574,6 +599,8 @@ if (!body || typeof body !== "object") {
         await this.page.goto("data:text/html,<html><body><h1>Extra Type</h1></body></html>")
         await this.page.exposeFunction("onSpeechEvent", this.handleSpeechEvent.bind(this))
         await this.page.exposeFunction("onBrowserRecStop", this.handleBrowserRecStop.bind(this))
+        await this.page.exposeFunction("onBrowserRecError", this.handleBrowserRecError.bind(this))
+        await this.page.exposeFunction("onBrowserRecRestart", this.handleBrowserRecRestart.bind(this))
         await this.page.evaluate(browser.initWSA, this.config.stream, this.config.lang)
     }
 
@@ -604,12 +631,34 @@ if (!body || typeof body !== "object") {
             this.silenceTimer = null
         }
     }
-    private async handleBrowserRecStop(payload: { reason: "silence" | "offline" | undefined }) {
+    private async handleBrowserRecStop(payload: { reason: "silence" | "offline" | "error" | undefined }) {
         if (!this.isWSAListening) return
         try {
-            await this.stopTranscription(payload.reason ?? "silence")
+            await this.stopTranscription(payload.reason === "error" ? "error" : (payload.reason ?? "silence"))
         } catch (e) {
             log("DAEMON", `Browser rec stop handling failed: ${e}`)
+        }
+    }
+
+    private setStatus(status: VizStatus, message?: string) {
+        updateVizState({ status, message: message ?? null })
+    }
+
+    private handleBrowserRecRestart() {
+        log("DAEMON", "Browser recognition session ended - resetting live-text diff")
+        this.typingController.recoverRestart()
+    }
+
+    private async handleBrowserRecError(payload: { code: string; message: string }) {
+        log("DAEMON", `Browser recognition error: ${payload.code} — ${payload.message}`)
+        if (this.isWSAListening) {
+            this.isWSAListening = false
+            this.setStatus("error", `${payload.code}: ${payload.message}`)
+            updateVizState({ listening: false })
+            this.tray.listening = false
+            await this.notifier.notifyError(`Recognition error: ${payload.message}`)
+        } else {
+            this.setStatus("error", payload.message)
         }
     }
 
@@ -618,7 +667,9 @@ if (!body || typeof body !== "object") {
         updateVizState({ lang })
         if (this.isWSAListening) {
             log("DAEMON", `Switching live language to '${lang}'...`)
-            updateVizState({ loading: true })
+            /* restarting WSA in place — same interim wipe hazard as a recover */
+            this.typingController.recoverRestart()
+            updateVizState({ loading: true, status: "recovering", message: "Switching language…" })
             await this.page!.evaluate(browser.setStopRequested, true)
             await this.page!.evaluate(browser.stopRecognition)
             this.clearSilenceTimer()
@@ -632,7 +683,7 @@ if (!body || typeof body !== "object") {
             this.transcriptTransformer.reset()
             this.speechPipeline = new SpeechPipeline(this.transcriptTransformer, this.typingController)
             await this.page!.evaluate(browser.setLangAndStart, lang)
-            updateVizState({ loading: false })
+            updateVizState({ loading: false, status: "listening", message: null })
             if (res) res.json({ listening: true, lang })
         } else {
             log("DAEMON", `Stored language for next start: '${lang}'`)

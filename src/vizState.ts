@@ -13,6 +13,8 @@ export interface VizState {
     /** true while the user is editing the pill pills / pylons / transcript by hand */
     pillDirty: boolean
     updatedAt: number
+    status: "listening" | "starting" | "recovering" | "error" | "offline" | "idle"
+    message: string | null
 }
 
 function statePath(): string {
@@ -40,6 +42,8 @@ export function updateVizState(partial: Partial<VizState>): void {
         dictationText: "",
         pillDirty: false,
         updatedAt: 0,
+        status: "idle",
+        message: null,
     }
     writeVizState({ ...current, ...partial, updatedAt: Date.now() })
 }

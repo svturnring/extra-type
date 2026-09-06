@@ -154,4 +154,34 @@ describe("TypingController", () => {
         tc.finalizeSegment()
         expect(tc.getPillText()).toBe("new")
     })
+
+    test("type-mode recoverRestart stops diffing stale interim (no backspace over dictated text)", () => {
+        const sink = new CapturingSink()
+        const tc = new TypingController(sink)
+        /* long interim already typed on screen */
+        tc.applyLiveText("the quick brown fox jumps")
+        /* browser/WSA restarts: reset the diff so the first partial of the new
+         * session is typed as new content instead of deleting the old */
+        tc.recoverRestart()
+        const before = sink.writes.length
+        tc.applyLiveText("hello")
+        const script = sink.writes.slice(before).join("")
+        expect(script).not.toContain("BackSpace")
+        expect(script).toContain("type hello\n")
+    })
+
+    test("pill-mode recoverRestart folds interrupted interim into finalized transcript", () => {
+        const sink = new CapturingSink()
+        const tc = new TypingController(sink, "ctrl+v", "pill")
+        const seen: string[] = []
+        tc.setPillListener((t) => seen.push(t))
+        tc.applyLiveText("we asked")
+        tc.recoverRestart()
+        /* interrupted interim is preserved in the pill text */
+        expect(tc.getPillText()).toBe("we asked")
+        /* next partial carries the leading space (as the API provides) */
+        tc.applyLiveText(" for help")
+        tc.finalizeSegment()
+        expect(tc.getPillText()).toBe("we asked for help")
+    })
 })

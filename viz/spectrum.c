@@ -129,6 +129,8 @@ static struct {
     int    pill;
     char   lang[16];
     int    tick;
+    char   status[16];
+    char   message[256];
 } g_viz;
 
 static GtkWidget *g_window = NULL;
@@ -136,6 +138,7 @@ static GtkApplication *g_app = NULL;
 static GtkWidget *g_draw = NULL;
 static gboolean g_paused = FALSE;
 static gboolean g_was_listening = -1; /* -1 = unknown until first poll */
+static gboolean g_was_error = -1;     /* -1 = unknown until first poll */
 
 /* pill/transcript overlay */
 static int g_port = DEFAULT_PORT;
@@ -144,6 +147,7 @@ static GtkWidget *g_pill_box = NULL;
 static GtkWidget *g_pill_scroll = NULL;
 static GtkTextView *g_textview = NULL;
 static GtkTextBuffer *g_textbuf = NULL;
+static GtkWidget *g_pill_caption = NULL;
 static gboolean g_pill_sync = FALSE;      /* TRUE while applying daemon text */
 static guint g_pill_update_id = 0;        /* debounce source for /pill/update */
 static char g_pill_last_sent[65536] = "";
@@ -260,7 +264,7 @@ static void teardown_pipewire(void) {
 /* ------------------------------------------------------------------ */
 #define BAR_W_DEFAULT 22
 #define BAR_GAP 6
-#define VIZ_W 127
+#define VIZ_W 160
 #define VIZ_H 48
 #define LAYER_MARGIN_BOTTOM 6
 
@@ -296,12 +300,26 @@ static void on_draw(GtkDrawingArea *area, cairo_t *cr, int wt, int h, gpointer d
     int tick = g_viz.tick;
     double pulse = 0.5 + 0.5 * sin((double)tick * 0.35);
 
-    /* accent colour by state */
+    /* accent colour by state: favour the rich status string, fall back to the
+     * legacy boolean flags when status is unexpectedly empty */
     double r, g, b;
-    if (g_viz.error) {
-        r = 0.96; g = 0.36; b = 0.34;           /* red = error */
+    int use = 0; /* 0 listening, 1 starting/recovering, 2 error, 3 offline */
+    if (g_viz.status[0]) {
+        if (strcmp(g_viz.status, "error") == 0) use = 2;
+        else if (strcmp(g_viz.status, "offline") == 0) use = 3;
+        else if (strcmp(g_viz.status, "starting") == 0 || strcmp(g_viz.status, "recovering") == 0) use = 1;
+        else use = 0;
+    } else if (g_viz.error) {
+        use = 2;
     } else if (g_viz.loading) {
-        r = 0.98; g = 0.78; b = 0.30;           /* amber = loading */
+        use = 1;
+    }
+    if (use == 2) {
+        r = 0.96; g = 0.36; b = 0.34;           /* red = error */
+    } else if (use == 3) {
+        r = 0.96; g = 0.36; b = 0.34;           /* red = offline */
+    } else if (use == 1) {
+        r = 0.98; g = 0.78; b = 0.30;           /* amber = starting/recovering */
     } else {
         r = 0.45; g = 0.90; b = 0.72;           /* teal = normal */
     }
@@ -338,25 +356,26 @@ static void on_draw(GtkDrawingArea *area, cairo_t *cr, int wt, int h, gpointer d
 
     /* label */
     if (label[0]) {
-        cairo_set_source_rgba(cr, r, g, b, g_viz.loading ? 0.55 + 0.45 * pulse : 0.8);
+        cairo_set_source_rgba(cr, r, g, b, use == 1 ? 0.55 + 0.45 * pulse : 0.8);
         cairo_move_to(cr, startX, cy + 4.0);
         cairo_show_text(cr, label);
     }
 
     /* bars */
     double barsX = startX + lw + label_bars_gap;
+    int listening = use == 0;
     for (int i = 0; i < NBARS; i++) {
         float lv = g_audio.bars[i];
         if (lv < 0) lv = 0;
         if (lv > 1) lv = 1;
         double boost;
-        if (g_viz.loading) {
+        if (use == 1) {
             double phase = tick * 0.06;
             boost = 0.6 + 0.4 * (0.5 + 0.5 * sin(phase - i * 1.1));
             dim = 1.0;
-        } else if (g_viz.error) {
+        } else if (use == 2 || use == 3) {
             boost = 0.55 + 0.3 * (1.0 - pulse);
-        } else if (g_viz.listening) {
+        } else if (listening) {
             /* smooth blend between silent idle circles and speaking wave.
              * g_audio.speak (0..1) rises/falls smoothly, so the transition is
              * animated rather than instant. */
@@ -374,8 +393,59 @@ static void on_draw(GtkDrawingArea *area, cairo_t *cr, int wt, int h, gpointer d
         double bh = 8.0 + boost * (2.0 * maxHalf - 8.0);   /* total height, centred on cy */
         double bx = barsX + i * (bw + gap);
         rounded_rect(cr, bx, cy - bh / 2.0, bw, bh, bw / 2.0);
-        cairo_set_source_rgba(cr, r, g, b, g_viz.loading ? 0.6 + 0.4 * pulse : 0.95 * dim);
+        cairo_set_source_rgba(cr, r, g, b, use == 1 ? 0.6 + 0.4 * pulse : 0.95 * dim);
         cairo_fill(cr);
+    }
+
+    /* status indicator in the right corner of the pill, drawn as cairo
+     * primitives (never a text glyph, so it cannot render as a tofu box):
+     *   listening   → filled dot
+     *   starting/   → throbbing hollow ring
+     *     recovering
+     *   error       → filled dot + white "!" bar
+     *   offline     → dot with a diagonal strike line
+     * Positioned inside the pill with a margin so it never touches the
+     * rounded corners. */
+    if (g_viz.status[0] || g_viz.listening || (use != 0)) {
+        double dx = W - 14.0;
+        double dy = cy;
+        double rad = 5.0;
+        cairo_set_line_width(cr, 2.0);
+        if (use == 2) {
+            /* error: solid red dot + white exclamation */
+            cairo_arc(cr, dx, dy, rad, 0, 2 * G_PI);
+            cairo_set_source_rgba(cr, 0.96, 0.36, 0.34, 1.0);
+            cairo_fill(cr);
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+            cairo_move_to(cr, dx, dy - 3.0);
+            cairo_line_to(cr, dx, dy - 0.6);
+            cairo_stroke(cr);
+            cairo_arc(cr, dx, dy + 2.0, 0.9, 0, 2 * G_PI);
+            cairo_fill(cr);
+        } else if (use == 3) {
+            /* offline: ring + diagonal strike */
+            cairo_arc(cr, dx, dy, rad, 0, 2 * G_PI);
+            cairo_set_source_rgba(cr, r, g, b, 0.9);
+            cairo_stroke(cr);
+            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+            cairo_move_to(cr, dx - rad * 0.7, dy - rad * 0.7);
+            cairo_line_to(cr, dx + rad * 0.7, dy + rad * 0.7);
+            cairo_stroke(cr);
+        } else if (use == 1) {
+            /* recovering: throbbing ring, visible only on alternating beats */
+            if ((tick / 4) % 2 == 0) {
+                double pr = rad + 1.5 + 1.5 * pulse;
+                cairo_arc(cr, dx, dy, pr, 0, 2 * G_PI);
+                cairo_set_source_rgba(cr, r, g, b, 0.7 + 0.3 * pulse);
+                cairo_stroke(cr);
+            }
+        } else {
+            /* listening: filled dot */
+            cairo_arc(cr, dx, dy, rad, 0, 2 * G_PI);
+            cairo_set_source_rgba(cr, r, g, b, 0.95);
+            cairo_fill(cr);
+        }
     }
 }
 
@@ -534,6 +604,8 @@ static void poll_viz_state(void) {
         g_viz.loading = 0;
         g_viz.error = 0;
         g_viz.pill = 0;
+        g_viz.status[0] = '\0';
+        g_viz.message[0] = '\0';
         return;
     }
     char buf[1024];
@@ -545,6 +617,9 @@ static void poll_viz_state(void) {
     g_viz.loading        = strstr(buf, "\"loading\":true") ? 1 : 0;
     g_viz.error          = (strstr(buf, "\"error\":null") == NULL && strstr(buf, "\"error\":\"") != NULL) ? 1 : 0;
     g_viz.pill           = strstr(buf, "\"pill\":true") ? 1 : 0;
+
+    extract_json_string(buf, "status", g_viz.status, sizeof(g_viz.status));
+    extract_json_string(buf, "message", g_viz.message, sizeof(g_viz.message));
 
     /* extract lang like "ru-RU" */
     g_viz.lang[0] = '\0';
@@ -672,10 +747,14 @@ static void ui_tick(GtkWidget *w, gpointer data) {
      * spectrum and only while dictating — after stop the text goes to the
      * clipboard and the overlay hides. */
     int overlay_on = g_viz.pill && g_viz.listening;
-    if (g_was_listening != g_viz.listening || g_had_pill != g_viz.pill) {
+    /* a fatal error while dictating must keep the pill visible (red status)
+     * until the daemon clears state — don't hide it on listening=false */
+    int err_state = g_viz.status[0] && (strcmp(g_viz.status, "error") == 0 || strcmp(g_viz.status, "offline") == 0);
+    if (g_was_listening != g_viz.listening || g_had_pill != g_viz.pill || (err_state && g_was_error != 1)) {
         g_was_listening = g_viz.listening;
         g_had_pill = g_viz.pill;
-        gboolean now_show = g_viz.listening || overlay_on;
+        g_was_error = err_state ? 1 : 0;
+        gboolean now_show = g_viz.listening || overlay_on || err_state;
         gtk_widget_set_visible(g_window, now_show);
         /* only the overlay (pill) mode lets the layer ask for the keyboard,
          * and only on demand; type/paste/dotool keep it NONE so the layer
@@ -697,6 +776,42 @@ static void ui_tick(GtkWidget *w, gpointer data) {
         if (pill_visible != want_pill_visible)
             gtk_widget_set_visible(g_pill_box, want_pill_visible);
         gtk_widget_set_visible(g_draw, !want_pill_visible);
+    }
+
+    /* live status line under the transcription (overlay/pill mode) */
+    if (g_pill_caption && g_pill_box && overlay_on) {
+        const char *txt = NULL;
+        int error_class = 0;
+        if (g_viz.status[0] && strcmp(g_viz.status, "error") == 0) {
+            txt = "Error: ";
+            error_class = 1;
+        } else if (g_viz.status[0] && strcmp(g_viz.status, "offline") == 0) {
+            txt = "Offline — recognition unavailable";
+        } else if (g_viz.status[0] &&
+                   (strcmp(g_viz.status, "starting") == 0 || strcmp(g_viz.status, "recovering") == 0)) {
+            txt = "Recovering… / Please wait";
+        }
+        const char *cur = gtk_label_get_text(GTK_LABEL(g_pill_caption));
+        char full[320];
+        if (txt) {
+            if (error_class) {
+                if (g_viz.message[0])
+                    snprintf(full, sizeof(full), "Error: %s", g_viz.message);
+                else
+                    snprintf(full, sizeof(full), "Error");
+                gtk_widget_add_css_class(g_pill_caption, "pill-status-error");
+            } else {
+                snprintf(full, sizeof(full), "%s", txt);
+                gtk_widget_remove_css_class(g_pill_caption, "pill-status-error");
+            }
+        } else {
+            snprintf(full, sizeof(full), "Turn off dictation to copy the text");
+            gtk_widget_remove_css_class(g_pill_caption, "pill-status-error");
+        }
+        /* only touch the label when the text actually changed to avoid
+         * needless redraws every tick */
+        if (strcmp(cur, full) != 0)
+            gtk_label_set_text(GTK_LABEL(g_pill_caption), full);
     }
 
     gtk_widget_queue_draw(GTK_WIDGET(g_draw));
@@ -812,7 +927,8 @@ static void viz_activate(GtkApplication *app) {
         "#pillbox text { color: #e6e6e6; }\n"
         "#pillbox textview text selection { background-color: alpha(@theme_selected_bg_color, 0.4); color: #ffffff; }\n"
         "#pillbox textview caret { color: #ffffff; }\n"
-        ".pill-caption { color: alpha(@theme_fg_color, 0.6); font-size: 11pt; }\n");
+        ".pill-caption { color: alpha(@theme_fg_color, 0.6); font-size: 11pt; }\n"
+        ".pill-status-error { color: #f05a4d; font-size: 11pt; font-weight: bold; }\n");
     gtk_style_context_add_provider_for_display(disp,
         GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
@@ -869,6 +985,7 @@ static void viz_activate(GtkApplication *app) {
 
     /* hint the user the transcript is copied on stop */
     GtkWidget *caption = gtk_label_new("Turn off dictation to copy the text");
+    g_pill_caption = caption;
     gtk_widget_set_halign(caption, GTK_ALIGN_START);
     gtk_widget_set_margin_top(caption, 4);
     gtk_widget_set_margin_bottom(caption, 4);
