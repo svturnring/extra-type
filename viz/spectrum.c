@@ -677,6 +677,12 @@ static void ui_tick(GtkWidget *w, gpointer data) {
         g_had_pill = g_viz.pill;
         gboolean now_show = g_viz.listening || overlay_on;
         gtk_widget_set_visible(g_window, now_show);
+        /* only the overlay (pill) mode lets the layer ask for the keyboard,
+         * and only on demand; type/paste/dotool keep it NONE so the layer
+         * never steals focus from the window the user is typing into */
+        gtk_layer_set_keyboard_mode(GTK_WINDOW(g_window),
+            g_viz.pill ? GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND
+                       : GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
         if (g_viz.pill) {
             gtk_widget_set_size_request(g_window, 560, 220);
         } else {
@@ -815,8 +821,11 @@ static void viz_activate(GtkApplication *app) {
     gtk_layer_set_layer(GTK_WINDOW(g_window), GTK_LAYER_SHELL_LAYER_OVERLAY);
     gtk_layer_set_anchor(GTK_WINDOW(g_window), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
     gtk_layer_set_margin(GTK_WINDOW(g_window), GTK_LAYER_SHELL_EDGE_BOTTOM, LAYER_MARGIN_BOTTOM);
-    /* focused keyboard so the user can edit the transcript textview */
-    gtk_layer_set_keyboard_mode(GTK_WINDOW(g_window), GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
+    /* The layer only interacts with the keyboard in overlay (pill) mode, and
+     * only then on demand (click) so the user can edit the transcript. In
+     * type/paste/dotool modes keyboard mode stays NONE so showing/hiding the
+     * indicator pill never steals focus from the dictation target window. */
+    gtk_layer_set_keyboard_mode(GTK_WINDOW(g_window), GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
     gtk_layer_set_exclusive_zone(GTK_WINDOW(g_window), 0);
 
     gtk_widget_set_size_request(g_window, VIZ_W, VIZ_H);
