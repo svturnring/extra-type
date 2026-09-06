@@ -9,7 +9,7 @@ import { CURRENT_VERSION, REPO } from "./constants.js"
 
 const streamPipeline = promisify(pipeline)
 
-const GITHUB_API = `https://api.github.com/repos/${REPO}/releases/latest`
+const GITHUB_API = `https://api.github.com/repos/${REPO}/releases`
 
 interface ReleaseInfo {
     tag: string
@@ -41,16 +41,25 @@ export function compareVersions(a: string, b: string): number {
     return 0
 }
 
-async function fetchRelease(): Promise<ReleaseInfo> {
-    const res = await fetch(GITHUB_API)
-    if (!res.ok) throw new Error(`GitHub API returned ${res.status}`)
-    const data = (await res.json()) as any
-    const tag = data.tag_name as string
-    const assets = (data.assets ?? []).map((a: any) => ({
+/** Pick the newest published release from a /releases list. The latest
+ * endpoint ignores pre-releases and 404s when every release is one, so we
+ * list all published releases and take the first non-draft one instead. */
+export function pickLatestRelease(releases: any[]): ReleaseInfo {
+    const latest = releases.find((r) => !r.draft)
+    if (!latest) throw new Error("No published releases found")
+    const assets = (latest.assets ?? []).map((a: any) => ({
         name: a.name,
         browser_download_url: a.browser_download_url,
     }))
-    return { tag, version: parseTag(tag), assets }
+    return { tag: latest.tag_name as string, version: parseTag(latest.tag_name), assets }
+}
+
+async function fetchRelease(): Promise<ReleaseInfo> {
+    const res = await fetch(GITHUB_API)
+    if (!res.ok) throw new Error(`GitHub API returned ${res.status}`)
+    const data = await res.json()
+    if (!Array.isArray(data)) throw new Error("Unexpected GitHub API response")
+    return pickLatestRelease(data)
 }
 
 async function downloadFile(url: string, dest: string): Promise<void> {
