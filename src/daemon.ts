@@ -38,6 +38,7 @@ export default class Daemon {
     private silenceTimer: NodeJS.Timeout | null = null
     private watchdogTimer: NodeJS.Timeout | null = null
     private recovering: boolean = false
+    private startConfirmTimer: NodeJS.Timeout | null = null
     private punctuationEnabled: boolean
     private currentLang: string
     private layoutWatcher: LayoutWatcher = createLayoutWatcher((lang) => {
@@ -343,11 +344,22 @@ if (!body || typeof body !== "object") {
         this.tray.listening = true
         this.typingController.hasStopped = false
         this.notifier.notifyMicStart()
-        updateVizState({ listening: true, lang, error: null, loading: false, status: "listening" })
+        updateVizState({ listening: true, lang, error: null, loading: true, status: "starting" })
 
         if (this.config.stream && this.config.timeout > 0) {
             this.resetSilenceTimer()
         }
+
+        this.clearStartConfirmTimer()
+        this.startConfirmTimer = setTimeout(() => {
+            this.startConfirmTimer = null
+            if (!this.isWSAListening) return
+            log("DAEMON", "Start confirmation timeout — recognition never started")
+            this.isWSAListening = false
+            this.tray.listening = false
+            updateVizState({ error: "Recognition did not start", listening: false, loading: false, status: "error", message: "Recognition did not start" })
+            void this.notifier.notifyError("Recognition did not start")
+        }, 8000)
 
         await this.page!.evaluate(browser.setLangAndStart, lang)
         res?.send("Listening")
@@ -387,6 +399,7 @@ if (!body || typeof body !== "object") {
 
         log("DAEMON", `Stopping transcription... Reason: ${reason}`)
         this.isWSAListening = false
+        this.clearStartConfirmTimer()
         this.tray.listening = false
         this.transcriptTransformer.reset()
         this.typingController.hasStopped = true
@@ -501,8 +514,6 @@ if (!body || typeof body !== "object") {
                 updateVizState({ loading: true, error: null })
                 try {
                     await this.page!.evaluate(browser.setLangAndStart, this.currentLang)
-                    this.setStatus("listening")
-                    updateVizState({ listening: true, error: null, loading: false })
                 } catch (e) {
                     log("DAEMON", `Watchdog: fast restart failed: ${e}`)
                     this.stallFastRetried = false
@@ -574,11 +585,19 @@ if (!body || typeof body !== "object") {
         }
         this.isWSAListening = true
         this.typingController.hasStopped = false
+        this.clearStartConfirmTimer()
+        this.startConfirmTimer = setTimeout(() => {
+            this.startConfirmTimer = null
+            if (!this.isWSAListening) return
+            log("DAEMON", "Recovery confirmation timeout — recognition never restarted")
+            this.isWSAListening = false
+            this.tray.listening = false
+            updateVizState({ error: "Recognition did not restart", listening: false, loading: false, status: "error", message: "Recognition did not restart" })
+            void this.notifier.notifyError("Recognition did not restart")
+        }, 8000)
         try {
             await this.page!.evaluate(browser.setLangAndStart, this.currentLang)
             this.stallFastRetried = false
-            this.setStatus("listening")
-            updateVizState({ listening: true, error: null, loading: false })
             log("DAEMON", "Recognition resumed after restart")
         } catch (e) {
             log("DAEMON", `Failed to resume recognition: ${e}`)
@@ -601,6 +620,7 @@ if (!body || typeof body !== "object") {
         await this.page.exposeFunction("onBrowserRecStop", this.handleBrowserRecStop.bind(this))
         await this.page.exposeFunction("onBrowserRecError", this.handleBrowserRecError.bind(this))
         await this.page.exposeFunction("onBrowserRecRestart", this.handleBrowserRecRestart.bind(this))
+        await this.page.exposeFunction("onBrowserRecStart", this.handleBrowserRecStart.bind(this))
         await this.page.evaluate(browser.initWSA, this.config.stream, this.config.lang)
     }
 
@@ -631,6 +651,12 @@ if (!body || typeof body !== "object") {
             this.silenceTimer = null
         }
     }
+    private clearStartConfirmTimer() {
+        if (this.startConfirmTimer) {
+            clearTimeout(this.startConfirmTimer)
+            this.startConfirmTimer = null
+        }
+    }
     private async handleBrowserRecStop(payload: { reason: "silence" | "offline" | "error" | undefined }) {
         if (!this.isWSAListening) return
         try {
@@ -647,6 +673,16 @@ if (!body || typeof body !== "object") {
     private handleBrowserRecRestart() {
         log("DAEMON", "Browser recognition session ended - resetting live-text diff")
         this.typingController.recoverRestart()
+    }
+
+    private handleBrowserRecStart(payload: Record<string, unknown>) {
+        void payload
+        log("DAEMON", "Browser recognition started - confirmed by WSA")
+        if (this.isWSAListening) {
+            this.clearStartConfirmTimer()
+            this.setStatus("listening")
+            updateVizState({ listening: true, error: null, loading: false })
+        }
     }
 
     private async handleBrowserRecError(payload: { code: string; message: string }) {
@@ -682,8 +718,17 @@ if (!body || typeof body !== "object") {
             )
             this.transcriptTransformer.reset()
             this.speechPipeline = new SpeechPipeline(this.transcriptTransformer, this.typingController)
+            this.clearStartConfirmTimer()
+            this.startConfirmTimer = setTimeout(() => {
+                this.startConfirmTimer = null
+                if (!this.isWSAListening) return
+                log("DAEMON", "Language switch confirmation timeout")
+                this.isWSAListening = false
+                this.tray.listening = false
+                updateVizState({ error: "Recognition did not restart after language switch", listening: false, loading: false, status: "error", message: "Recognition did not restart after language switch" })
+                void this.notifier.notifyError("Recognition did not restart after language switch")
+            }, 8000)
             await this.page!.evaluate(browser.setLangAndStart, lang)
-            updateVizState({ loading: false, status: "listening", message: null })
             if (res) res.json({ listening: true, lang })
         } else {
             log("DAEMON", `Stored language for next start: '${lang}'`)

@@ -132,8 +132,13 @@ export function initWSA(stream, lang) {
         rec.isRunning = true
         window.__recState.running = true
         window.__recState.restartCount = 0
+        window.__recState.lastError = null
+        window.__recState.lastErrorAt = 0
         window.__lastAudioAt = Date.now()
         window.__lastResultAt = Date.now()
+        if (window.onBrowserRecStart) {
+            window.onBrowserRecStart({})
+        }
     }
 
     rec.onresult = (event) => {

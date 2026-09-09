@@ -19,12 +19,10 @@ export default class Notifier {
 
     async notifyDaemonStart() {
         await this.textNotifier.notifyDaemonStart()
-        await this.soundNotifier.notifyStart()
     }
 
     async notifyDaemonStop() {
         await this.textNotifier.notifyDaemonStop()
-        await this.soundNotifier.notifyStop()
     }
 
     async notifyMicStart() {

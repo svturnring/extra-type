@@ -347,8 +347,9 @@ static void on_draw(GtkDrawingArea *area, cairo_t *cr, int wt, int h, gpointer d
         lw = te.x_advance;
     }
     double label_bars_gap = label[0] ? 10.0 : 0.0;
-    double side = 19.0;                     /* real padding on each side */
-    double startX = side;
+    /* centre the whole cluster (label + bars) so the pill has equal space
+     * on both sides — no reserved area for a right-side status dot */
+    double startX = (W - (lw + label_bars_gap + barsW)) / 2.0;
 
     double cy = H / 2.0;
     double maxHalf = 12.0;                   /* max bar half-height (shorter) */
@@ -440,11 +441,6 @@ static void on_draw(GtkDrawingArea *area, cairo_t *cr, int wt, int h, gpointer d
                 cairo_set_source_rgba(cr, r, g, b, 0.7 + 0.3 * pulse);
                 cairo_stroke(cr);
             }
-        } else {
-            /* listening: filled dot */
-            cairo_arc(cr, dx, dy, rad, 0, 2 * G_PI);
-            cairo_set_source_rgba(cr, r, g, b, 0.95);
-            cairo_fill(cr);
         }
     }
 }
