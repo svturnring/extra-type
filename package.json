@@ -1,6 +1,6 @@
 {
     "name": "extra-type",
-    "version": "0.1.2-alpha",
+    "version": "0.1.0-alpha.1",
     "description": "Dictation for Linux Wayland, reworked from voice-type",
     "type": "module",
     "os": [

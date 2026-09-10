@@ -11,7 +11,9 @@ A system-wide speech-to-text daemon for Linux/Wayland.
 - `config.ts`, `types.ts` — config load/validate and `ExtraTypeConfig` type (includes `autodetect_lang`, `visualizer`).
 - `visualizer.ts` — spawns/kills `extra-type-viz` (detached).
 - `vizState.ts` — daemon→viz handoff via `~/.local/state/extra-type/viz-state.json`.
-- `browserLauncher.ts`, `browser.js`, `browserRecognition.js` — headless Chrome via puppeteer-core.
+- `browserLauncher.ts`, `browser.js`, `browserRecognition.js` — headless Chrome via puppeteer-core. The page pushes lifecycle events to the daemon
+  through exposed functions (`onSpeechEvent`, `onBrowserRecStart/Stop/Error/Restart`); `onBrowserRecStart` fires on the WSA `onstart` callback and is the
+  authoritative "dictation is live" signal.
 - `layoutWatcher.ts` — pluggable layout detection chain (replaces hardcoded hyprctl).
 - `layoutProviders/` — chain: hypr → sway → xkb → fallback. Each provider is optional.
 - `tray.ts` — StatusNotifierItem (SNI) via `dbus-next` + DBusMenu (toggle, settings, quit).
@@ -129,15 +131,22 @@ captures the paste combo with the same key-grabber as the hotkey but stores name
 
 ### Watchdog
 
-The daemon polls browser health every 5 s while listening (`watchdogTick`). If the page dies or recognition stops,
-it reinitializes the browser, shows `loading`/`error` in the pill and resumes recognition.
+Recognition state is **push-based**: the browser fires `onBrowserRecStart` on the WSA `onstart`
+callback and the daemon only then turns the pill green (`status:"listening"`). Start, browser
+recovery, and live language switch keep the pill amber (`starting`/`recovering`) until that
+confirmation, with an 8 s timeout guard that flips to red (`error`) if recognition never starts.
+
+The daemon polls browser health every 5 s while listening (`watchdogTick`) purely as a backstop
+for silent stalls (WSA stops producing callbacks with no `onend`/`onerror`). If the page dies or
+recognition stops, it reinitializes the browser, shows `loading`/`error` in the pill and resumes
+recognition.
 
 ### Sounds
 
 - `sound: true` → embedded start/stop MP3s on recording start and stop (extracted from the binary to
   `tmpdir()` as `extra-type-start.mp3`/`extra-type-stop.mp3`, played via mpv/ffplay/pw-play, or canberra `-f`),
   freedesktop system sounds (`dialog-error`) for offline/error.
-- Text notifications (D-Bus) are always on; the settings toggle was removed.
+- Daemon start/stop itself plays no sounds — only text notifications (D-Bus, always on; the settings toggle was removed).
 - The start/stop sound files are compiled into the daemon (`src/soundsData.ts`); user config has no `sound_start`/`sound_stop`.
 
 ### Caveats

@@ -751,6 +751,16 @@ static void ui_tick(GtkWidget *w, gpointer data) {
         g_had_pill = g_viz.pill;
         g_was_error = err_state ? 1 : 0;
         gboolean now_show = g_viz.listening || overlay_on || err_state;
+        /* set the size BEFORE showing to avoid a transparent first frame at
+         * the wrong dimensions — gtk4-layer-shell re-maps the surface on
+         * resize, so showing at VIZ_W×VIZ_H and then resizing to 560×220
+         * leaves a ghost transparent frame until the compositor acks the
+         * new size */
+        if (g_viz.pill) {
+            gtk_widget_set_size_request(g_window, 560, 220);
+        } else {
+            gtk_widget_set_size_request(g_window, VIZ_W, VIZ_H);
+        }
         gtk_widget_set_visible(g_window, now_show);
         /* only the overlay (pill) mode lets the layer ask for the keyboard,
          * and only on demand; type/paste/dotool keep it NONE so the layer
@@ -758,11 +768,6 @@ static void ui_tick(GtkWidget *w, gpointer data) {
         gtk_layer_set_keyboard_mode(GTK_WINDOW(g_window),
             g_viz.pill ? GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND
                        : GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
-        if (g_viz.pill) {
-            gtk_widget_set_size_request(g_window, 560, 220);
-        } else {
-            gtk_widget_set_size_request(g_window, VIZ_W, VIZ_H);
-        }
     }
 
     /* spectrum above the transcript is hidden in overlay mode */
@@ -810,7 +815,14 @@ static void ui_tick(GtkWidget *w, gpointer data) {
             gtk_label_set_text(GTK_LABEL(g_pill_caption), full);
     }
 
-    gtk_widget_queue_draw(GTK_WIDGET(g_draw));
+    /* redraw the right target every tick: in pill mode g_draw is hidden
+     * and the pill_box lives under g_window so queue on the window;
+     * in spectrum mode g_draw is the DrawingArea whose on_draw callback
+     * paints the bars — queue on it, not the window */
+    if (g_viz.pill)
+        gtk_widget_queue_draw(g_window);
+    else
+        gtk_widget_queue_draw(GTK_WIDGET(g_draw));
     if (g_once) exit(0);
 }
 

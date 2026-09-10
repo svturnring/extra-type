@@ -13,13 +13,14 @@ import { createNoopTransformerSession } from "./transcriptTransformers/noop.js"
 import type { TranscriptTransformerSession } from "./transcriptTransformers/types.js"
 import { createLayoutWatcher, type LayoutWatcher } from "./layoutWatcher.js"
 import { Tray } from "./tray.js"
-import { updateVizState } from "./vizState.js"
+import { updateVizState, resetVizState } from "./vizState.js"
 import { startVisualizer, stopVisualizer } from "./visualizer.js"
 import { startHotkeyDaemon, stopHotkeyDaemon } from "./hotkey.js"
 import { openSettingsWindow, closeSettingsWindow } from "./settingsLauncher.js"
 import SpeechPipeline from "./speechPipeline.js"
 import { shouldAcceptSpeechEvent } from "./speechEventGate.js"
 import type { SpeechEvent, ExtraTypeConfig, VizStatus } from "./types.js"
+import { execSync } from "node:child_process"
 
 export default class Daemon {
     private readonly config: ExtraTypeConfig
@@ -59,6 +60,7 @@ export default class Daemon {
         onQuit: () => {
             void (async () => {
                 await this.destroy()
+                this.forceKillAll()
                 process.exit(0)
             })()
         },
@@ -76,6 +78,11 @@ export default class Daemon {
         this.typingController.setPillListener((text) => {
             updateVizState({ pill: true, dictationText: text, pillDirty: false })
         })
+        /* seed a full idle state so a stale listening:true from a previous
+         * hard-killed session cannot make the viz flash an empty overlay
+         * before dictation starts — the compositor shows the layer surface
+         * immediately on listen, so it must begin in a known-hidden state */
+        resetVizState(config.insert_method === "pill", config.lang)
         this.punctuationEnabled = config.punctuation
         this.currentLang = config.insert_method === "dotool" ? "en-US" : config.lang
         this.app = express()
@@ -132,6 +139,7 @@ export default class Daemon {
             await this.notifier.notifyDaemonStop()
             res.send("Stopped daemon")
             await this.destroy()
+            this.forceKillAll()
             process.exit(0)
         })
 
@@ -809,6 +817,7 @@ if (!body || typeof body !== "object") {
         this.layoutWatcher.stop()
         this.tray.dispose()
         this.clearSilenceTimer()
+        resetVizState(this.config.insert_method === "pill", this.currentLang || this.config.lang)
         if (this.watchdogTimer) {
             clearInterval(this.watchdogTimer)
             this.watchdogTimer = null
@@ -829,6 +838,28 @@ if (!body || typeof body !== "object") {
         ])
         this.page = null
         this.browser = null
+    }
+
+    /** Force-kill every process spawned by extra-type: Chromium, viz, hotkey,
+     *  dotool, settings window.  Called from the tray Quit handler so that
+     *  no orphaned child survives even if destroy() times out. */
+    private forceKillAll() {
+        const toKill = [
+            "chromium",
+            "chrome",
+            "google-chrome",
+            "extra-type-viz",
+            "extra-type-hotkey",
+            "extra-type-settings",
+            "dotool",
+        ]
+        for (const name of toKill) {
+            try {
+                execSync(`pkill -9 -f ${name}`, { timeout: 2000 })
+            } catch {
+                /* process not found — ignore */
+            }
+        }
     }
 }
 

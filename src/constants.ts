@@ -45,5 +45,5 @@ export const WSA_LANGUAGES = {
 
 export const PORT = 3232
 
-export const CURRENT_VERSION = "0.1.2-alpha"
+export const CURRENT_VERSION = "0.1.0-alpha.1"
 export const REPO = "svturnring/extra-type"

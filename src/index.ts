@@ -145,6 +145,13 @@ async function main() {
         const daemon = new Daemon(config)
         const destroy = async () => {
             await daemon.destroy()
+            /* nuclear option: kill every extra-type child that survived the
+             * graceful shutdown — Chromium, viz, hotkey, dotool, settings */
+            const { execSync } = await import("node:child_process")
+            for (const name of ["chromium", "chrome", "google-chrome",
+                "extra-type-viz", "extra-type-hotkey", "extra-type-settings", "dotool"]) {
+                try { execSync(`pkill -9 -f ${name}`, { timeout: 2000 }) } catch { /* not found */ }
+            }
             process.exit(0)
         }
         process.on("SIGTERM", destroy)
