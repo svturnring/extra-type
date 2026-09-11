@@ -67,7 +67,7 @@ Or single-command install: `sh install.sh`
 - Chrome/Chromium (Web Speech API)
 - wtype (char typing via Wayland virtual keyboard); wl-copy only when `insert_method: "paste"`
 - dotool only when `insert_method: "dotool"` (needs `/dev/uinput` access, `input` group)
-- GTK4, gtk4-layer-shell, PipeWire, libsoup3, json-glib (viz + settings window)
+- GTK4, gtk4-layer-shell, PipeWire, libsoup3, json-glib (viz + settings window); libadwaita-1 (settings window)
 - dbus-next (tray icon)
 
 ### Layout detection

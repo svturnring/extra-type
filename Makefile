@@ -17,8 +17,8 @@ PKG_CONFIG ?= pkg-config
 VIZ_CFLAGS  := $(shell $(PKG_CONFIG) --cflags gtk4 gtk4-layer-shell-0 libpipewire-0.3 libspa-0.2)
 VIZ_LDFLAGS := $(shell $(PKG_CONFIG) --libs gtk4 gtk4-layer-shell-0 libpipewire-0.3 libspa-0.2) -lm
 
-VIZ_CFLAGS_SETTINGS := $(shell $(PKG_CONFIG) --cflags gtk4 libsoup-3.0 json-glib-1.0)
-VIZ_LDFLAGS_SETTINGS := $(shell $(PKG_CONFIG) --libs gtk4 libsoup-3.0 json-glib-1.0)
+VIZ_CFLAGS_SETTINGS := $(shell $(PKG_CONFIG) --cflags gtk4 libadwaita-1 libsoup-3.0 json-glib-1.0)
+VIZ_LDFLAGS_SETTINGS := $(shell $(PKG_CONFIG) --libs gtk4 libadwaita-1 libsoup-3.0 json-glib-1.0)
 
 SRC_TS := $(shell find src -name '*.ts' -o -name '*.js' | sort)
 
