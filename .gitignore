@@ -1,6 +1,7 @@
 node_modules
 dist
 build
+release-x64
 bun.lock
 TODO.md
 releases
