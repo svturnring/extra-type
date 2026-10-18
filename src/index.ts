@@ -62,13 +62,13 @@ async function main() {
         return up
     }
 
-    async function doToggle() {
+    async function requestDictation(route: "toggle" | "start" | "stop") {
         const up = await ensureDaemon()
         if (!up) return
-        const lang = config.autodetect_lang ? detectLanguage() : null
+        const lang = config.autodetect_lang && route !== "stop" ? detectLanguage() : null
         const q = lang ? `?lang=${lang}` : ""
         for (let i = 0; i < 40; i++) {
-            const res = await jsonGet(`/toggle${q}`, 15000)
+            const res = await jsonGet(`/${route}${q}`, 15000)
             if (res) {
                 const body = await res.text()
                 console.log(body || "ok")
@@ -77,6 +77,20 @@ async function main() {
             await new Promise((r) => setTimeout(r, 300))
         }
         console.error("daemon did not become ready in time")
+    }
+
+    async function doToggle() {
+        await requestDictation("toggle")
+    }
+
+    /* stop must not spawn the daemon just to shut it down — a dead daemon
+     * already means nothing is listening */
+    async function doToggleStop() {
+        if (!(await isDaemonUp())) {
+            console.log("extra-type daemon is not running")
+            return
+        }
+        await requestDictation("stop")
     }
 
     async function doStatus() {
@@ -159,15 +173,21 @@ async function main() {
         await daemon.start()
     }
 
-    if (arg === "update") {
-        const { runUpdate } = await import("./updater.js")
-        await runUpdate()
-        return
-    }
-
     if (arg === "toggle") {
-        await doToggle()
-        return
+        if (arg2 === undefined) {
+            await doToggle()
+            return
+        }
+        if (arg2 === "start") {
+            await requestDictation("start")
+            return
+        }
+        if (arg2 === "stop") {
+            await doToggleStop()
+            return
+        }
+        console.error("Usage: extra-type toggle [start|stop]")
+        process.exit(1)
     }
 
     if (arg === "status") {

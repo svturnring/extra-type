@@ -6,7 +6,7 @@ A system-wide speech-to-text daemon for Linux/Wayland.
 
 ### Daemon (`src/`, TypeScript/Bun)
 
-- `index.ts` — CLI entry (`extra-type`, `extra-type toggle|status|stop|start|help|settings|lang|autodetect|update`).
+- `index.ts` — CLI entry (`extra-type`, `extra-type toggle [start|stop]`, `extra-type status|stop|start|help|settings|lang|autodetect`).
 - `daemon.ts` — HTTP daemon on 127.0.0.1:3232. Routes: `/health`, `/status`, `/start`, `/stop`, `/toggle`, `/exit`, `/togglePunctuation`, `/setlang`, `/config` (GET+POST), `/pill/clear`, `/open-settings`.
 - `config.ts`, `types.ts` — config load/validate and `ExtraTypeConfig` type (includes `autodetect_lang`, `visualizer`).
 - `visualizer.ts` — spawns/kills `extra-type-viz` (detached).

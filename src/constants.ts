@@ -45,5 +45,8 @@ export const WSA_LANGUAGES = {
 
 export const PORT = 3232
 
-export const CURRENT_VERSION = "0.1.0-alpha.1"
-export const REPO = "svturnring/extra-type"
+import pkg from "../package.json" with { type: "json" }
+
+/* Single source of truth for the version: it lives in package.json and is
+ * baked into the compiled binary by bun. */
+export const VERSION: string = pkg.version

@@ -45,12 +45,6 @@ Live typing works correctly only in native Wayland apps. In Chrome and Electron 
 
 There is also an experimental **Dotool (uinput)** insertion mode for such apps — it types through `/dev/uinput` like a real keyboard, so it works even in XWayland apps and Google Chrome. It is **English only**: it resolves keysyms against the US layout, so the target app must be on the US/English layout for correct output. Selecting it forces the dictation language to English.
 
-## Update
-
-```bash
-extra-type update
-```
-
 ## Uninstall
 
 ```bash

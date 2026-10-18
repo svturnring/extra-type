@@ -41,8 +41,6 @@ describes what it touches and what the attack surface looks like.
 - **Recognition**: audio is sent by Chrome to Google's Web Speech API endpoint.
 - **API**: the daemon serves an HTTP API bound to `127.0.0.1` only, never the
   network, and has no authentication (single-user desktop design).
-- **Self-update**: `extra-type update` talks to the GitHub Releases API of the
-  `svturnring/extra-type` repo.
 - **No telemetry**: extra-type collects no usage analytics and sends nothing
   unrelated to the above.
 

@@ -4,6 +4,8 @@ EXTRA TYPE - System-Wide Dictation Daemon
 Usage:
   extra-type                 Run the daemon (foreground).
   extra-type toggle          Start daemon if needed, toggle dictation.
+  extra-type toggle start    Start daemon if needed, start dictation.
+  extra-type toggle stop     Stop dictation (daemon keeps running).
   extra-type start           Run the daemon (foreground).
   extra-type status          Show daemon status.
   extra-type stop            Stop the daemon.
